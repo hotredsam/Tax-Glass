@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TaxGlass Pro | 1040 AI Processor</title>
+    <link rel="stylesheet" href="style.css">
+    <!-- External Libraries -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.25/jspdf.plugin.autotable.min.js"></script>
+</head>
+<body>
+    <div class="background-blobs">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+        <div class="blob blob-3"></div>
+    </div>
+
+    <main class="glass-container">
+        <header>
+            <h1 class="logo">Tax<span>Glass</span></h1>
+            <p class="subtitle">Intelligent Tax Return Processing</p>
+        </header>
+
+        <section class="workflow">
+            <div class="step-card">
+                <div class="step-icon">1</div>
+                <h3>Download Template</h3>
+                <p>Get the standardized Excel format for your tax data.</p>
+                <button id="downloadBtn" class="btn secondary">Download .xlsx</button>
+            </div>
+
+            <div class="step-card">
+                <div class="step-icon">2</div>
+                <h3>Upload Data</h3>
+                <p>Upload your filled template for instant processing.</p>
+                <div class="upload-area" id="dropZone">
+                    <input type="file" id="fileInput" accept=".xlsx, .xls" hidden>
+                    <label for="fileInput" class="upload-label">
+                        <span class="icon">↑</span>
+                        <span>Choose a file or drag here</span>
+                    </label>
+                </div>
+            </div>
+        </section>
+
+        <section id="statusSection" class="status-section hidden">
+            <div class="loader"></div>
+            <p id="statusText">Processing your return...</p>
+        </section>
+
+        <section id="resultSection" class="result-section hidden">
+            <div class="success-card">
+                <h3>Processing Complete!</h3>
+                <p>We've detected <span id="missingCount">0</span> missing items.</p>
+                <button id="generatePdfBtn" class="btn primary">Download Tax Return PDF</button>
+            </div>
+        </section>
+    </main>
+
+    <script src="script.js"></script>
+</body>
+</html>
