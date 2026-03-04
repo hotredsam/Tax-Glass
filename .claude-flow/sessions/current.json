@@ -1,0 +1,14 @@
+{
+  "id": "session-1772449772162",
+  "startedAt": "2026-03-02T11:09:32.162Z",
+  "platform": "win32",
+  "cwd": "C:\\Users\\hotre\\OneDrive\\Desktop\\Coding Projects\\TaxGlass",
+  "context": {},
+  "metrics": {
+    "edits": 0,
+    "commands": 0,
+    "tasks": 0,
+    "errors": 0
+  },
+  "restoredAt": "2026-03-02T11:10:45.598Z"
+}
