@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "profile": "minimal",
+  "features": {
+    "hooks": false,
+    "statusLine": false,
+    "autoMemory": false,
+    "agentTeams": false
+  },
+  "memory": {
+    "importOnSessionStart": false,
+    "syncOnStop": false,
+    "storePath": ".claude-flow/data/auto-memory-store.json"
+  }
+}
