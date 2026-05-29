@@ -85,6 +85,100 @@ impl CellRef {
             self.row + 1
         )
     }
+
+    /// Format in R1C1 notation relative to `base`. Absolute (`$`) parts render
+    /// as fixed `R{n}`/`C{n}`; relative parts as `R[delta]`/`C[delta]` (or a
+    /// bare `R`/`C` when the delta is zero).
+    pub fn to_r1c1(&self, base: CellRef) -> String {
+        let r = r1c1_part('R', self.row, self.row_abs, base.row);
+        let c = r1c1_part('C', self.col, self.col_abs, base.col);
+        format!("{r}{c}")
+    }
+
+    /// Format in absolute R1C1 notation (`R{row}C{col}`), ignoring `$` markers.
+    pub fn to_r1c1_absolute(&self) -> String {
+        format!("R{}C{}", self.row + 1, self.col + 1)
+    }
+
+    /// Parse an R1C1 reference relative to `base`. Handles absolute (`R1C1`),
+    /// relative-with-delta (`R[-1]C[2]`), and bare relative (`RC`, `RC[1]`).
+    pub fn parse_r1c1(s: &str, base: CellRef) -> Result<Self> {
+        let s = s.trim();
+        let bytes = s.as_bytes();
+        let mut i = 0;
+
+        let parse_part = |letter: u8, i: &mut usize, base_idx: u32| -> Result<(u32, bool)> {
+            if bytes.get(*i) != Some(&letter) {
+                return Err(EngineError::BadReference(s.to_string()));
+            }
+            *i += 1;
+            // Bare letter (relative, delta 0): nothing or next is the other letter.
+            let next = bytes.get(*i).copied();
+            if next == Some(b'[') {
+                *i += 1;
+                let start = *i;
+                if bytes.get(*i) == Some(&b'-') {
+                    *i += 1;
+                }
+                while *i < bytes.len() && bytes[*i].is_ascii_digit() {
+                    *i += 1;
+                }
+                let num: i64 = s[start..*i]
+                    .parse()
+                    .map_err(|_| EngineError::BadReference(s.to_string()))?;
+                if bytes.get(*i) != Some(&b']') {
+                    return Err(EngineError::BadReference(s.to_string()));
+                }
+                *i += 1;
+                let idx = base_idx as i64 + num;
+                if idx < 0 {
+                    return Err(EngineError::BadReference(s.to_string()));
+                }
+                Ok((idx as u32, false))
+            } else if matches!(next, Some(b'0'..=b'9')) {
+                let start = *i;
+                while *i < bytes.len() && bytes[*i].is_ascii_digit() {
+                    *i += 1;
+                }
+                let num: u32 = s[start..*i]
+                    .parse()
+                    .map_err(|_| EngineError::BadReference(s.to_string()))?;
+                if num == 0 {
+                    return Err(EngineError::BadReference(s.to_string()));
+                }
+                Ok((num - 1, true))
+            } else {
+                // Bare relative, delta 0.
+                Ok((base_idx, false))
+            }
+        };
+
+        let (row, row_abs) = parse_part(b'R', &mut i, base.row)?;
+        let (col, col_abs) = parse_part(b'C', &mut i, base.col)?;
+        if i != s.len() {
+            return Err(EngineError::BadReference(s.to_string()));
+        }
+        Ok(CellRef {
+            col,
+            row,
+            col_abs,
+            row_abs,
+        })
+    }
+}
+
+/// Render one R1C1 coordinate part.
+fn r1c1_part(letter: char, idx: u32, abs: bool, base_idx: u32) -> String {
+    if abs {
+        format!("{letter}{}", idx + 1)
+    } else {
+        let delta = idx as i64 - base_idx as i64;
+        if delta == 0 {
+            letter.to_string()
+        } else {
+            format!("{letter}[{delta}]")
+        }
+    }
 }
 
 impl fmt::Display for CellRef {
@@ -250,5 +344,48 @@ mod tests {
     fn single_ref_is_unit_range() {
         let range = CellRange::parse("D5").unwrap();
         assert_eq!(range.len(), 1);
+    }
+
+    #[test]
+    fn r1c1_absolute_and_relative_formatting() {
+        let base = CellRef::parse("B2").unwrap(); // (col 1, row 1)
+                                                  // Absolute $A$1 -> R1C1.
+        assert_eq!(CellRef::parse("$A$1").unwrap().to_r1c1(base), "R1C1");
+        // Relative A1 from B2: row delta -1, col delta -1.
+        assert_eq!(CellRef::parse("A1").unwrap().to_r1c1(base), "R[-1]C[-1]");
+        // Same cell as base -> RC.
+        assert_eq!(CellRef::parse("B2").unwrap().to_r1c1(base), "RC");
+        // Mixed: $A1 (col abs, row rel) from B2 -> R[-1]C1.
+        assert_eq!(CellRef::parse("$A1").unwrap().to_r1c1(base), "R[-1]C1");
+        assert_eq!(CellRef::parse("C5").unwrap().to_r1c1_absolute(), "R5C3");
+    }
+
+    #[test]
+    fn r1c1_parse_roundtrips() {
+        let base = CellRef::parse("B2").unwrap();
+        for a1 in ["$A$1", "A1", "B2", "$A1", "A$1", "Z10"] {
+            let r = CellRef::parse(a1).unwrap();
+            let r1c1 = r.to_r1c1(base);
+            let back = CellRef::parse_r1c1(&r1c1, base).unwrap();
+            assert_eq!(back, r, "{a1} -> {r1c1}");
+        }
+    }
+
+    #[test]
+    fn r1c1_parse_specific_forms() {
+        let base = CellRef::parse("C3").unwrap(); // (col 2, row 2)
+        assert_eq!(
+            CellRef::parse_r1c1("R1C1", base).unwrap(),
+            CellRef::parse("$A$1").unwrap()
+        );
+        assert_eq!(
+            CellRef::parse_r1c1("RC", base).unwrap(),
+            CellRef::parse("C3").unwrap()
+        );
+        assert_eq!(
+            CellRef::parse_r1c1("R[-1]C[1]", base).unwrap(),
+            CellRef::parse("D2").unwrap()
+        );
+        assert!(CellRef::parse_r1c1("R[-5]C", base).is_err(), "negative row");
     }
 }

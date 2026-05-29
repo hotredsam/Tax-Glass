@@ -78,7 +78,20 @@ pub fn parse(input: &str) -> Result<Expr> {
 /// than its parent's), so the result is always correct, if occasionally more
 /// parenthesized than a human would write.
 pub fn unparse(expr: &Expr) -> String {
-    render(expr, 0)
+    render(expr, 0, RefStyle::A1)
+}
+
+/// Render an expression with references in R1C1 notation relative to `base`
+/// (the cell the formula lives in). Used for the R1C1 display mode.
+pub fn to_r1c1(expr: &Expr, base: CellRef) -> String {
+    render(expr, 0, RefStyle::R1C1(base))
+}
+
+/// How references are rendered while unparsing.
+#[derive(Clone, Copy)]
+enum RefStyle {
+    A1,
+    R1C1(CellRef),
 }
 
 /// Binding strength used only for unparsing. Higher binds tighter.
@@ -97,36 +110,44 @@ fn precedence(expr: &Expr) -> u8 {
     }
 }
 
-fn render(expr: &Expr, parent: u8) -> String {
+fn render(expr: &Expr, parent: u8, style: RefStyle) -> String {
     let prec = precedence(expr);
     let body = match expr {
         Expr::Number(n) => crate::value::format_number(*n),
         Expr::Text(t) => format!("\"{}\"", t.replace('"', "\"\"")),
         Expr::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-        Expr::Ref(r) => r.to_a1(),
-        Expr::Range(range) => range.to_string(),
-        Expr::SheetRef(sheet, r) => format!("{}!{}", quote_sheet(sheet), r.to_a1()),
-        Expr::SheetRange(sheet, range) => format!("{}!{}", quote_sheet(sheet), range),
-        Expr::ColSpan { start, end } => format!(
-            "{}:{}",
-            crate::address::index_to_column(*start),
-            crate::address::index_to_column(*end)
-        ),
-        Expr::RowSpan { start, end } => format!("{}:{}", start + 1, end + 1),
+        Expr::Ref(r) => render_ref(*r, style),
+        Expr::Range(range) => render_range(*range, style),
+        Expr::SheetRef(sheet, r) => format!("{}!{}", quote_sheet(sheet), render_ref(*r, style)),
+        Expr::SheetRange(sheet, range) => {
+            format!("{}!{}", quote_sheet(sheet), render_range(*range, style))
+        }
+        Expr::ColSpan { start, end } => match style {
+            RefStyle::A1 => format!(
+                "{}:{}",
+                crate::address::index_to_column(*start),
+                crate::address::index_to_column(*end)
+            ),
+            RefStyle::R1C1(_) => format!("C{}:C{}", start + 1, end + 1),
+        },
+        Expr::RowSpan { start, end } => match style {
+            RefStyle::A1 => format!("{}:{}", start + 1, end + 1),
+            RefStyle::R1C1(_) => format!("R{}:R{}", start + 1, end + 1),
+        },
         Expr::Name(name) => name.clone(),
         Expr::RefError => "#REF!".to_string(),
-        Expr::Neg(inner) => format!("-{}", render(inner, prec)),
-        Expr::Percent(inner) => format!("{}%", render(inner, prec)),
+        Expr::Neg(inner) => format!("-{}", render(inner, prec, style)),
+        Expr::Percent(inner) => format!("{}%", render(inner, prec, style)),
         Expr::Binary(op, lhs, rhs) => {
             format!(
                 "{}{}{}",
-                render(lhs, prec),
+                render(lhs, prec, style),
                 binop_str(*op),
-                render(rhs, prec)
+                render(rhs, prec, style)
             )
         }
         Expr::Func(name, args) => {
-            let rendered: Vec<String> = args.iter().map(|a| render(a, 0)).collect();
+            let rendered: Vec<String> = args.iter().map(|a| render(a, 0, style)).collect();
             format!("{}({})", name, rendered.join(","))
         }
     };
@@ -135,6 +156,22 @@ fn render(expr: &Expr, parent: u8) -> String {
         format!("({body})")
     } else {
         body
+    }
+}
+
+fn render_ref(r: CellRef, style: RefStyle) -> String {
+    match style {
+        RefStyle::A1 => r.to_a1(),
+        RefStyle::R1C1(base) => r.to_r1c1(base),
+    }
+}
+
+fn render_range(range: CellRange, style: RefStyle) -> String {
+    match style {
+        RefStyle::A1 => range.to_string(),
+        RefStyle::R1C1(base) => {
+            format!("{}:{}", range.start.to_r1c1(base), range.end.to_r1c1(base))
+        }
     }
 }
 
@@ -884,6 +921,16 @@ mod tests {
         for s in ["A:A", "A:C", "2:5"] {
             assert_eq!(unparse(&p(s)), s);
         }
+    }
+
+    #[test]
+    fn renders_formula_in_r1c1() {
+        let base = CellRef::parse("C3").unwrap();
+        // A1 from C3 -> R[-2]C[-2]; $A$1 -> R1C1.
+        assert_eq!(to_r1c1(&p("A1+$A$1"), base), "R[-2]C[-2]+R1C1");
+        // Range and a whole column.
+        assert_eq!(to_r1c1(&p("SUM(A1:A3)"), base), "SUM(R[-2]C[-2]:RC[-2])");
+        assert_eq!(to_r1c1(&p("SUM(B:B)"), base), "SUM(C2:C2)");
     }
 
     #[test]
