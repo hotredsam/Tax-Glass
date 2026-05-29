@@ -7,6 +7,7 @@
 use crate::address::{CellRange, CellRef};
 use crate::error::{EngineError, Result};
 use crate::sheet::Sheet;
+use crate::theme::Theme;
 use crate::value::Value;
 use std::collections::HashMap;
 
@@ -26,6 +27,7 @@ pub struct Workbook {
     sheets: Vec<Sheet>,
     active: usize,
     names: HashMap<String, DefinedName>,
+    theme: Theme,
 }
 
 impl Default for Workbook {
@@ -35,6 +37,7 @@ impl Default for Workbook {
             sheets: vec![Sheet::new("Sheet1")],
             active: 0,
             names: HashMap::new(),
+            theme: Theme::default(),
         }
     }
 }
@@ -52,7 +55,18 @@ impl Workbook {
             sheets: Vec::new(),
             active: 0,
             names: HashMap::new(),
+            theme: Theme::default(),
         }
+    }
+
+    /// The workbook's theme.
+    pub fn theme(&self) -> &Theme {
+        &self.theme
+    }
+
+    /// Set the workbook's theme.
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
     }
 
     /// Number of sheets.
@@ -290,6 +304,15 @@ fn normalize_name(name: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::address::CellRef;
+
+    #[test]
+    fn workbook_theme_defaults_and_switches() {
+        let mut wb = Workbook::new();
+        assert_eq!(wb.theme().name, "Light");
+        wb.set_theme(Theme::glass());
+        assert_eq!(wb.theme().name, "Glass");
+        assert!(wb.theme().dark);
+    }
 
     #[test]
     fn default_has_one_sheet() {
