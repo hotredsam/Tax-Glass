@@ -625,6 +625,20 @@ impl<'a> Evaluator<'a> {
             "ROUND" => self.round_family(args, RoundMode::Half),
             "ROUNDUP" => self.round_family(args, RoundMode::Up),
             "ROUNDDOWN" => self.round_family(args, RoundMode::Down),
+            "MROUND" => self.scalar2(args, |n, m| {
+                if m == 0.0 {
+                    Value::Number(0.0)
+                } else {
+                    Value::Number((n / m).round() * m)
+                }
+            }),
+            "CEILING" | "CEILING.MATH" => self.ceiling_floor(args, true),
+            "FLOOR" | "FLOOR.MATH" => self.ceiling_floor(args, false),
+            "EVEN" => self.scalar1(args, |n| Value::Number(round_to_parity(n, true))),
+            "ODD" => self.scalar1(args, |n| Value::Number(round_to_parity(n, false))),
+            "SUMPRODUCT" => self.func_sumproduct(args),
+            "SUBTOTAL" => self.func_subtotal(args),
+            "AGGREGATE" => self.func_aggregate(args),
 
             // --- logical ---
             "IF" => self.func_if(args),
@@ -796,6 +810,154 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// CEILING/FLOOR with optional significance (default 1).
+    fn ceiling_floor(&mut self, args: &[Expr], up: bool) -> Value {
+        if args.is_empty() || args.len() > 2 {
+            return Value::Error(CellError::Value);
+        }
+        let n = match self.eval(&args[0]).as_number() {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        };
+        let sig = if args.len() == 2 {
+            match self.eval(&args[1]).as_number() {
+                Ok(s) => s,
+                Err(e) => return Value::Error(e),
+            }
+        } else {
+            1.0
+        };
+        if sig == 0.0 {
+            return Value::Number(0.0);
+        }
+        let q = n / sig;
+        let rounded = if up { q.ceil() } else { q.floor() };
+        Value::Number(rounded * sig)
+    }
+
+    /// SUMPRODUCT: element-wise product of equal-length arrays, summed.
+    fn func_sumproduct(&mut self, args: &[Expr]) -> Value {
+        if args.is_empty() {
+            return Value::Error(CellError::Value);
+        }
+        let arrays: Vec<Vec<f64>> = args
+            .iter()
+            .map(|a| {
+                self.flatten(a)
+                    .iter()
+                    .map(|v| v.as_number().unwrap_or(0.0))
+                    .collect()
+            })
+            .collect();
+        let len = arrays[0].len();
+        if arrays.iter().any(|a| a.len() != len) {
+            return Value::Error(CellError::Value);
+        }
+        let mut total = 0.0;
+        for i in 0..len {
+            let mut product = 1.0;
+            for a in &arrays {
+                product *= a[i];
+            }
+            total += product;
+        }
+        Value::Number(total)
+    }
+
+    /// SUBTOTAL(func_num, ref...). Supports the common function numbers (and
+    /// their 1xx "ignore hidden" equivalents, treated identically here).
+    fn func_subtotal(&mut self, args: &[Expr]) -> Value {
+        if args.len() < 2 {
+            return Value::Error(CellError::Value);
+        }
+        let func = match self.eval(&args[0]).as_number() {
+            Ok(n) => (n as i64) % 100,
+            Err(e) => return Value::Error(e),
+        };
+        self.aggregate_by_num(func, &args[1..], false)
+    }
+
+    /// AGGREGATE(func_num, options, ref...). Options 2/3/6/7 ignore error values.
+    fn func_aggregate(&mut self, args: &[Expr]) -> Value {
+        if args.len() < 3 {
+            return Value::Error(CellError::Value);
+        }
+        let func = match self.eval(&args[0]).as_number() {
+            Ok(n) => n as i64,
+            Err(e) => return Value::Error(e),
+        };
+        let option = match self.eval(&args[1]).as_number() {
+            Ok(n) => n as i64,
+            Err(e) => return Value::Error(e),
+        };
+        let skip_errors = matches!(option, 2 | 3 | 6 | 7);
+        self.aggregate_by_num(func, &args[2..], skip_errors)
+    }
+
+    /// Shared dispatch for SUBTOTAL/AGGREGATE function numbers.
+    fn aggregate_by_num(&mut self, func: i64, refs: &[Expr], skip_errors: bool) -> Value {
+        if func == 3 {
+            // COUNTA: count non-empty.
+            let mut count = 0;
+            for arg in refs {
+                for v in self.flatten(arg) {
+                    if let Value::Error(e) = v {
+                        if !skip_errors {
+                            return Value::Error(e);
+                        }
+                    } else if v != Value::Empty {
+                        count += 1;
+                    }
+                }
+            }
+            return Value::Number(count as f64);
+        }
+        let nums = match self.gather_numbers(refs, skip_errors) {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        };
+        match func {
+            1 => {
+                if nums.is_empty() {
+                    Value::Error(CellError::Div0)
+                } else {
+                    Value::Number(nums.iter().sum::<f64>() / nums.len() as f64)
+                }
+            }
+            2 => Value::Number(nums.len() as f64),
+            4 => Value::Number(nums.iter().cloned().fold(f64::MIN, f64::max)),
+            5 => Value::Number(nums.iter().cloned().fold(f64::MAX, f64::min)),
+            6 => Value::Number(nums.iter().product()),
+            9 => Value::Number(nums.iter().sum()),
+            _ => Value::Error(CellError::Value),
+        }
+    }
+
+    /// Like [`Self::collect_numbers`] but optionally tolerates error values.
+    fn gather_numbers(&mut self, args: &[Expr], skip_errors: bool) -> Result<Vec<f64>, CellError> {
+        let mut nums = Vec::new();
+        for arg in args {
+            for v in self.flatten(arg) {
+                match v {
+                    Value::Error(e) => {
+                        if !skip_errors {
+                            return Err(e);
+                        }
+                    }
+                    Value::Empty => {}
+                    Value::Number(n) => nums.push(n),
+                    Value::Bool(b) => nums.push(if b { 1.0 } else { 0.0 }),
+                    Value::Text(t) => {
+                        if let Ok(n) = t.trim().parse::<f64>() {
+                            nums.push(n);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(nums)
+    }
+
     // --- function helpers ---
 
     fn numeric_agg(&mut self, args: &[Expr], init: f64, f: fn(f64, f64) -> f64) -> Value {
@@ -941,6 +1103,23 @@ enum IfsKind {
     Sum,
     Average,
     Count,
+}
+
+/// Round away from zero to the next even (`even = true`) or odd integer.
+fn round_to_parity(n: f64, even: bool) -> f64 {
+    if n == 0.0 {
+        return 0.0;
+    }
+    let mut x = n.abs().ceil() as i64;
+    if (x % 2 == 0) != even {
+        x += 1;
+    }
+    let r = x as f64;
+    if n < 0.0 {
+        -r
+    } else {
+        r
+    }
 }
 
 /// Match a value against an Excel criteria string/number, e.g. `">5"`, `"<>0"`,
@@ -1157,6 +1336,44 @@ mod tests {
             ("A4", "=A3^2"),
         ]);
         assert_eq!(val(&s, "A4"), Value::Number(64.0));
+    }
+
+    #[test]
+    fn rounding_family() {
+        let s = sheet_with(&[
+            ("A1", "=MROUND(10,3)"),
+            ("A2", "=CEILING(2.1,1)"),
+            ("A3", "=FLOOR(2.9,1)"),
+            ("A4", "=EVEN(3)"),
+            ("A5", "=ODD(2)"),
+            ("A6", "=CEILING.MATH(4.2)"),
+        ]);
+        assert_eq!(val(&s, "A1"), Value::Number(9.0));
+        assert_eq!(val(&s, "A2"), Value::Number(3.0));
+        assert_eq!(val(&s, "A3"), Value::Number(2.0));
+        assert_eq!(val(&s, "A4"), Value::Number(4.0));
+        assert_eq!(val(&s, "A5"), Value::Number(3.0));
+        assert_eq!(val(&s, "A6"), Value::Number(5.0));
+    }
+
+    #[test]
+    fn sumproduct_subtotal_aggregate() {
+        let s = sheet_with(&[
+            ("A1", "1"),
+            ("A2", "2"),
+            ("A3", "3"),
+            ("B1", "4"),
+            ("B2", "5"),
+            ("B3", "6"),
+            ("C1", "=SUMPRODUCT(A1:A3,B1:B3)"), // 1*4+2*5+3*6 = 32
+            ("C2", "=SUBTOTAL(9,A1:A3)"),       // SUM = 6
+            ("C3", "=SUBTOTAL(1,A1:A3)"),       // AVERAGE = 2
+            ("C4", "=AGGREGATE(4,6,A1:A3)"),    // MAX = 3
+        ]);
+        assert_eq!(val(&s, "C1"), Value::Number(32.0));
+        assert_eq!(val(&s, "C2"), Value::Number(6.0));
+        assert_eq!(val(&s, "C3"), Value::Number(2.0));
+        assert_eq!(val(&s, "C4"), Value::Number(3.0));
     }
 
     #[test]
