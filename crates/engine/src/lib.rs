@@ -46,7 +46,7 @@ pub use format::format_value;
 pub use formula::{BinOp, Expr};
 pub use goalseek::{goal_seek, GoalSeekResult};
 pub use recalc::RecalcEngine;
-pub use sheet::{CellContent, Comment, Sheet};
+pub use sheet::{CellContent, Comment, Reply, Sheet};
 pub use style::{Alignment, Border, BorderStyle, Borders, CellStyle, Color, Font, HAlign, VAlign};
 pub use theme::{Palette, Theme};
 pub use undo::History;

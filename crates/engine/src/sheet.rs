@@ -53,11 +53,25 @@ pub enum CellContent {
     Formula { src: String, ast: Expr },
 }
 
-/// A note attached to a cell.
+/// One reply within a comment thread.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Reply {
+    pub author: Option<String>,
+    pub text: String,
+    pub created_at: std::time::SystemTime,
+}
+
+/// A note attached to a cell — a threaded, resolvable, taggable comment that
+/// goes well beyond Excel's plain notes: it carries a creation timestamp, a
+/// resolved flag, free-form tags, and a reply thread.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Comment {
     pub author: Option<String>,
     pub text: String,
+    pub created_at: std::time::SystemTime,
+    pub resolved: bool,
+    pub tags: Vec<String>,
+    pub replies: Vec<Reply>,
 }
 
 impl Comment {
@@ -66,6 +80,10 @@ impl Comment {
         Comment {
             author: None,
             text: text.into(),
+            created_at: std::time::SystemTime::now(),
+            resolved: false,
+            tags: Vec::new(),
+            replies: Vec::new(),
         }
     }
 
@@ -73,8 +91,28 @@ impl Comment {
     pub fn by(author: impl Into<String>, text: impl Into<String>) -> Self {
         Comment {
             author: Some(author.into()),
-            text: text.into(),
+            ..Comment::new(text)
         }
+    }
+
+    /// Builder: attach a tag.
+    pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
+        self.tags.push(tag.into());
+        self
+    }
+
+    /// Append a reply to the thread.
+    pub fn add_reply(&mut self, author: Option<String>, text: impl Into<String>) {
+        self.replies.push(Reply {
+            author,
+            text: text.into(),
+            created_at: std::time::SystemTime::now(),
+        });
+    }
+
+    /// Total messages in the thread (root + replies).
+    pub fn thread_len(&self) -> usize {
+        1 + self.replies.len()
     }
 }
 
@@ -382,6 +420,41 @@ impl Sheet {
     /// Remove and return a cell's comment.
     pub fn remove_comment(&mut self, r: CellRef) -> Option<Comment> {
         self.comments.remove(&(r.col, r.row))
+    }
+
+    /// Append a reply to a cell's comment thread. Returns `false` if the cell
+    /// has no comment.
+    pub fn reply_to_comment(
+        &mut self,
+        r: CellRef,
+        author: Option<String>,
+        text: impl Into<String>,
+    ) -> bool {
+        match self.comments.get_mut(&(r.col, r.row)) {
+            Some(c) => {
+                c.add_reply(author, text);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Mark a cell's comment resolved/unresolved. Returns `false` if absent.
+    pub fn resolve_comment(&mut self, r: CellRef, resolved: bool) -> bool {
+        match self.comments.get_mut(&(r.col, r.row)) {
+            Some(c) => {
+                c.resolved = resolved;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Iterate all commented cells with their comments.
+    pub fn comments(&self) -> impl Iterator<Item = (CellRef, &Comment)> {
+        self.comments
+            .iter()
+            .map(|(&(c, r), comment)| (CellRef::new(c, r), comment))
     }
 
     /// Attach a data-validation rule to a range.
@@ -1001,6 +1074,27 @@ mod tests {
         let removed = s.remove_comment(cell("C2"));
         assert!(removed.is_some());
         assert!(s.comment(cell("C2")).is_none());
+    }
+
+    #[test]
+    fn threaded_resolvable_tagged_notes() {
+        let mut s = Sheet::new("Sheet1");
+        s.set_comment(
+            cell("A1"),
+            Comment::by("Ada", "Is this figure right?").with_tag("review"),
+        );
+        assert!(s.reply_to_comment(cell("A1"), Some("Bob".into()), "Yes, confirmed."));
+        assert!(s.reply_to_comment(cell("A1"), None, "Thanks!"));
+        assert!(s.resolve_comment(cell("A1"), true));
+
+        let c = s.comment(cell("A1")).unwrap();
+        assert_eq!(c.thread_len(), 3); // root + 2 replies
+        assert!(c.resolved);
+        assert_eq!(c.tags, ["review"]);
+        assert_eq!(c.replies[0].author.as_deref(), Some("Bob"));
+
+        // Replying to a cell without a comment fails cleanly.
+        assert!(!s.reply_to_comment(cell("Z9"), None, "nobody home"));
     }
 
     #[test]
