@@ -26,6 +26,7 @@ pub mod eval;
 pub mod format;
 pub mod formula;
 pub mod goalseek;
+pub mod kernels;
 pub mod recalc;
 pub mod sheet;
 pub mod style;

@@ -583,20 +583,23 @@ impl<'a> Evaluator<'a> {
 
     fn eval_func(&mut self, name: &str, args: &[Expr]) -> Value {
         match name {
-            // --- aggregation ---
-            "SUM" => self.numeric_agg(args, 0.0, |acc, n| acc + n),
-            "PRODUCT" => self.numeric_agg(args, 1.0, |acc, n| acc * n),
-            "MIN" => self.minmax(args, true),
-            "MAX" => self.minmax(args, false),
-            "AVERAGE" => match self.collect_numbers(args) {
-                Err(e) => Value::Error(e),
-                Ok(ns) if ns.is_empty() => Value::Error(CellError::Div0),
-                Ok(ns) => Value::Number(ns.iter().sum::<f64>() / ns.len() as f64),
-            },
-            "COUNT" => match self.collect_numbers(args) {
-                Err(e) => Value::Error(e),
-                Ok(ns) => Value::Number(ns.len() as f64),
-            },
+            // --- aggregation (streamed into a reused buffer + kernel reduce) ---
+            "SUM" => self.agg(args, |xs| Value::Number(crate::kernels::sum(xs))),
+            "PRODUCT" => self.agg(args, |xs| Value::Number(crate::kernels::product(xs))),
+            "MIN" => self.agg(args, |xs| {
+                Value::Number(crate::kernels::min(xs).unwrap_or(0.0))
+            }),
+            "MAX" => self.agg(args, |xs| {
+                Value::Number(crate::kernels::max(xs).unwrap_or(0.0))
+            }),
+            "AVERAGE" => self.agg(args, |xs| {
+                if xs.is_empty() {
+                    Value::Error(CellError::Div0)
+                } else {
+                    Value::Number(crate::kernels::sum(xs) / xs.len() as f64)
+                }
+            }),
+            "COUNT" => self.agg(args, |xs| Value::Number(xs.len() as f64)),
             "SUMIF" => self.func_sumif(args),
             "AVERAGEIF" => self.func_averageif(args),
             "COUNTIF" => self.func_countif(args),
@@ -1296,25 +1299,85 @@ impl<'a> Evaluator<'a> {
 
     // --- function helpers ---
 
-    fn numeric_agg(&mut self, args: &[Expr], init: f64, f: fn(f64, f64) -> f64) -> Value {
-        match self.collect_numbers(args) {
-            Ok(ns) => Value::Number(ns.into_iter().fold(init, f)),
+    /// Stream the numeric arguments into a pooled scratch buffer (no per-call
+    /// `Vec<Value>`/`Vec<f64>` allocation in steady state), then reduce with
+    /// `reduce`. Errors in the inputs short-circuit to that error value.
+    fn agg(&mut self, args: &[Expr], reduce: impl FnOnce(&[f64]) -> Value) -> Value {
+        let mut buf = take_scratch();
+        let out = match self.gather_numeric(args, &mut buf) {
+            Ok(()) => reduce(&buf),
             Err(e) => Value::Error(e),
-        }
+        };
+        give_scratch(buf);
+        out
     }
 
-    fn minmax(&mut self, args: &[Expr], min: bool) -> Value {
-        match self.collect_numbers(args) {
-            Err(e) => Value::Error(e),
-            Ok(ns) if ns.is_empty() => Value::Number(0.0),
-            Ok(ns) => {
-                let mut acc = ns[0];
-                for &n in &ns[1..] {
-                    acc = if min { acc.min(n) } else { acc.max(n) };
+    /// Stream every argument's numeric values into `out`, skipping blanks and
+    /// non-numeric text (as Excel does within ranges) and propagating errors.
+    /// Unlike `flatten`/`collect_numbers`, this never builds an intermediate
+    /// `Vec<Value>`.
+    fn gather_numeric(&mut self, args: &[Expr], out: &mut Vec<f64>) -> Result<(), CellError> {
+        for arg in args {
+            self.gather_one(arg, out)?;
+        }
+        Ok(())
+    }
+
+    fn gather_one(&mut self, expr: &Expr, out: &mut Vec<f64>) -> Result<(), CellError> {
+        match expr {
+            Expr::Range(range) => {
+                let sheet = self.current;
+                for c in range.cells() {
+                    push_number(self.value_at(sheet, c.col, c.row), out)?;
                 }
-                Value::Number(acc)
+            }
+            Expr::SheetRange(name, range) => match self.sheet_index(name) {
+                Some(idx) => {
+                    for c in range.cells() {
+                        push_number(self.value_at(idx, c.col, c.row), out)?;
+                    }
+                }
+                None => return Err(CellError::Ref),
+            },
+            Expr::ColSpan { start, end } => {
+                let (_, rows) = self.cells.dimensions(self.current);
+                let sheet = self.current;
+                for col in *start..=*end {
+                    for row in 0..rows {
+                        push_number(self.value_at(sheet, col, row), out)?;
+                    }
+                }
+            }
+            Expr::RowSpan { start, end } => {
+                let (cols, _) = self.cells.dimensions(self.current);
+                let sheet = self.current;
+                for row in *start..=*end {
+                    for col in 0..cols {
+                        push_number(self.value_at(sheet, col, row), out)?;
+                    }
+                }
+            }
+            Expr::Array(rows) => {
+                for e in rows.iter().flatten() {
+                    let v = self.eval(e);
+                    push_number(v, out)?;
+                }
+            }
+            // A named range expands to its target cells (matching `flatten`).
+            Expr::Name(name) => match self.cells.resolve_name(name) {
+                Some((idx, range)) => {
+                    for c in range.cells() {
+                        push_number(self.value_at(idx, c.col, c.row), out)?;
+                    }
+                }
+                None => return Err(CellError::Name),
+            },
+            other => {
+                let v = self.eval(other);
+                push_number(v, out)?;
             }
         }
+        Ok(())
     }
 
     fn bool_agg(&mut self, args: &[Expr], all: bool) -> Value {
@@ -1494,6 +1557,47 @@ fn next_rand() -> f64 {
         s.set(x);
         (x >> 11) as f64 / (1u64 << 53) as f64
     })
+}
+
+thread_local! {
+    /// A small pool of reusable `f64` buffers for aggregation. Buffers are
+    /// taken for the duration of one reduction and returned afterwards, so
+    /// nested aggregates (e.g. `SUM` over a cell that is itself `AVERAGE(...)`)
+    /// each get their own buffer without re-entrant borrow panics.
+    static SCRATCH_POOL: std::cell::RefCell<Vec<Vec<f64>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_scratch() -> Vec<f64> {
+    SCRATCH_POOL
+        .with(|p| p.borrow_mut().pop())
+        .unwrap_or_default()
+}
+
+fn give_scratch(mut buf: Vec<f64>) {
+    buf.clear();
+    SCRATCH_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.len() < 32 {
+            p.push(buf);
+        }
+    });
+}
+
+/// Append a value's numeric content to `out`: blanks/non-numeric text are
+/// skipped, booleans count as 1/0, and an error short-circuits.
+fn push_number(v: Value, out: &mut Vec<f64>) -> Result<(), CellError> {
+    match v {
+        Value::Error(e) => return Err(e),
+        Value::Empty => {}
+        Value::Number(n) => out.push(n),
+        Value::Bool(b) => out.push(if b { 1.0 } else { 0.0 }),
+        Value::Text(t) => {
+            if let Ok(n) = t.trim().parse::<f64>() {
+                out.push(n);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn gcd(a: u64, b: u64) -> u64 {

@@ -47,10 +47,22 @@ fn bench_incremental_edit(c: &mut Criterion) {
     });
 }
 
+fn bench_aggregate(c: &mut Criterion) {
+    // SUM over a 50k-cell column exercises the streaming gather + kernel reduce.
+    let mut s = Sheet::new("Agg");
+    for row in 0..50_000u32 {
+        s.set_input(CellRef::new(0, row), &row.to_string()).unwrap();
+    }
+    s.set_formula(CellRef::new(1, 0), "=SUM(A1:A50000)")
+        .unwrap();
+    c.bench_function("sum_over_50k", |b| b.iter(|| black_box(s.evaluate())));
+}
+
 criterion_group!(
     benches,
     bench_full_evaluate,
     bench_parse,
-    bench_incremental_edit
+    bench_incremental_edit,
+    bench_aggregate
 );
 criterion_main!(benches);
