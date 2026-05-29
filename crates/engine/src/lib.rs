@@ -17,6 +17,7 @@
 //! ```
 
 pub mod address;
+pub mod datetime;
 pub mod deps;
 pub mod error;
 pub mod eval;

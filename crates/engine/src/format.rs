@@ -21,6 +21,13 @@ pub fn format_value(value: &Value, code: &str) -> String {
         return value.as_text();
     }
 
+    // A date/time format code renders a numeric serial as a calendar value.
+    if let Value::Number(n) = value {
+        if looks_like_date(code) {
+            return crate::datetime::format_serial(*n, code);
+        }
+    }
+
     let sections = split_sections(code);
     match value {
         Value::Number(n) => format_number_value(*n, &sections),
@@ -32,6 +39,29 @@ pub fn format_value(value: &Value, code: &str) -> String {
         },
         Value::Error(_) => unreachable!(),
     }
+}
+
+/// Heuristic: a code is a date/time format if it contains date/time letters
+/// (`y d h s` or month/minute `m`) outside of quotes. Numeric formats use only
+/// `0 # ? , . %` and literals.
+fn looks_like_date(code: &str) -> bool {
+    let mut in_quote = false;
+    let mut chars = code.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => in_quote = !in_quote,
+            '\\' => {
+                chars.next();
+            }
+            c if !in_quote => {
+                if matches!(c, 'y' | 'Y' | 'd' | 'D' | 'h' | 'H' | 's' | 'S' | 'm' | 'M') {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Split a format code into sections on `;`, ignoring separators inside quotes.
