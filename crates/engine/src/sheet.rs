@@ -7,6 +7,7 @@ use crate::error::Result;
 use crate::eval::evaluate_sheet;
 use crate::formula::{self, Expr};
 use crate::style::CellStyle;
+use crate::validation::Validation;
 use crate::value::Value;
 use std::collections::HashMap;
 
@@ -59,6 +60,7 @@ pub struct Sheet {
     cells: HashMap<(u32, u32), CellContent>,
     styles: HashMap<(u32, u32), CellStyle>,
     cond_rules: Vec<Rule>,
+    validations: Vec<Validation>,
 }
 
 impl Sheet {
@@ -69,6 +71,7 @@ impl Sheet {
             cells: HashMap::new(),
             styles: HashMap::new(),
             cond_rules: Vec::new(),
+            validations: Vec::new(),
         }
     }
 
@@ -166,6 +169,50 @@ impl Sheet {
     pub fn conditional_styles(&self) -> HashMap<(u32, u32), CellStyle> {
         let computed = self.evaluate();
         crate::condformat::effective_styles(&self.cond_rules, &computed)
+    }
+
+    /// Attach a data-validation rule to a range.
+    pub fn add_validation(&mut self, validation: Validation) {
+        self.validations.push(validation);
+    }
+
+    /// The data-validation rules on this sheet.
+    pub fn validations(&self) -> &[Validation] {
+        &self.validations
+    }
+
+    /// Check whether `candidate` would be a valid entry at `cell`. Returns
+    /// `Ok(())` if no validation covers the cell or the value passes; otherwise
+    /// `Err(message)` using the rule's message (or a default).
+    pub fn validate(&self, cell: CellRef, candidate: &Value) -> std::result::Result<(), String> {
+        if self.validations.is_empty() {
+            return Ok(());
+        }
+        // Resolve ListFromRange lazily against the computed grid.
+        let computed = self.evaluate();
+        let resolve = |range: &CellRange| -> Vec<Value> {
+            range
+                .cells()
+                .map(|c| {
+                    computed
+                        .get(&(c.col, c.row))
+                        .cloned()
+                        .unwrap_or(Value::Empty)
+                })
+                .collect()
+        };
+        for v in &self.validations {
+            if v.range.contains(cell) {
+                if v.rule.check(candidate, &resolve) {
+                    return Ok(());
+                }
+                return Err(v
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "value does not meet validation criteria".into()));
+            }
+        }
+        Ok(())
     }
 
     /// The displayed text of a cell: its computed value rendered through the
@@ -604,6 +651,44 @@ mod tests {
         // A cell without a number format displays its general value.
         s.set_input(cell("A2"), "5").unwrap();
         assert_eq!(s.display(cell("A2")), "5");
+    }
+
+    #[test]
+    fn data_validation_checks_candidates() {
+        use crate::validation::{Validation, ValidationRule};
+
+        let mut s = Sheet::new("Sheet1");
+        // A dropdown list backed by D1:D2.
+        s.set_input(cell("D1"), "Red").unwrap();
+        s.set_input(cell("D2"), "Blue").unwrap();
+        s.add_validation(Validation::new(
+            CellRange::parse("A1:A10").unwrap(),
+            ValidationRule::ListFromRange(CellRange::parse("D1:D2").unwrap()),
+        ));
+        s.add_validation(
+            Validation::new(
+                CellRange::parse("B1:B10").unwrap(),
+                ValidationRule::WholeNumber {
+                    min: Some(1.0),
+                    max: Some(5.0),
+                },
+            )
+            .with_message("must be 1-5"),
+        );
+
+        assert!(s.validate(cell("A1"), &Value::Text("blue".into())).is_ok());
+        assert!(s
+            .validate(cell("A1"), &Value::Text("green".into()))
+            .is_err());
+        assert!(s.validate(cell("B1"), &Value::Number(3.0)).is_ok());
+        assert_eq!(
+            s.validate(cell("B1"), &Value::Number(9.0)).unwrap_err(),
+            "must be 1-5"
+        );
+        // A cell outside any validation range accepts anything.
+        assert!(s
+            .validate(cell("Z9"), &Value::Text("whatever".into()))
+            .is_ok());
     }
 
     #[test]

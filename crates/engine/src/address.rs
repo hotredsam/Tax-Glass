@@ -223,6 +223,14 @@ impl CellRange {
         }
     }
 
+    /// Whether a cell falls within this range (ignoring `$` markers).
+    pub fn contains(&self, cell: CellRef) -> bool {
+        cell.col >= self.start.col
+            && cell.col <= self.end.col
+            && cell.row >= self.start.row
+            && cell.row <= self.end.row
+    }
+
     /// Iterate the cells of the range in row-major order.
     pub fn cells(&self) -> impl Iterator<Item = CellRef> + '_ {
         (self.start.row..=self.end.row).flat_map(move |row| {
