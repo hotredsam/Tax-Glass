@@ -1,87 +1,89 @@
-# TaxGlass Pro
+# GlassSheet
 
-A client-side tax return processor with a glassmorphism UI. Users download a standardized Excel template, fill in their 1040 data, upload it back, and the app generates a formatted PDF tax return. All processing happens in the browser -- no server, no backend, no data leaves the machine.
+A spreadsheet application written in Rust — a fast, native "better Excel." The
+project is a Cargo workspace: a pure-Rust calculation **engine** plus front-ends
+that build on it (currently a CLI; desktop/web/mobile planned).
+
+> This repo was previously a browser-based tax tool ("TaxGlass Pro"). It has been
+> rewritten in Rust as a general-purpose spreadsheet app. There is **no tax
+> logic** anymore — do not reintroduce it.
 
 ## Tech Stack
 
-| Technology         | Version   | Purpose                                  |
-|--------------------|-----------|------------------------------------------|
-| HTML5              | --        | Page structure                           |
-| CSS3               | --        | Glassmorphism styling with CSS variables |
-| JavaScript (ES6+)  | Vanilla   | All application logic                    |
-| ExcelJS            | 4.4.0     | Template generation (styled .xlsx)       |
-| SheetJS (xlsx)     | 0.18.5    | Reading uploaded Excel files             |
-| jsPDF              | 2.5.1     | PDF generation                           |
-| jsPDF-AutoTable    | 3.5.25    | PDF table formatting                     |
+| Technology | Purpose                                            |
+|------------|----------------------------------------------------|
+| Rust 2021  | Everything                                         |
+| Cargo      | Workspace build, test, lint                        |
+| `clap`     | CLI argument parsing                               |
+| `csv`      | CSV import/export in the CLI                       |
+| `serde`    | Serialization of the value/address model           |
+| `thiserror`| Error types                                        |
 
-No Node.js, no npm, no build step. Open `index.html` in a browser.
+No Node, no npm, no CDNs. Build with `cargo`.
 
-## File Structure
+## Workspace layout
 
 ```
-TaxGlass/
-  index.html       # Single-page application entry
-  script.js        # All JS logic: template generation, file upload, PDF rendering
-  style.css        # Glassmorphism theme with CSS custom properties
-  README.md        # Project overview
+Cargo.toml              # workspace manifest + shared dependency versions
+crates/
+  engine/               # glasssheet-engine (library) — the calculation core
+    src/value.rs        #   Value + CellError (in-cell #DIV/0! etc.)
+    src/address.rs      #   CellRef / CellRange + A1 <-> index conversion
+    src/formula.rs      #   tokenizer, Expr AST, recursive-descent parser
+    src/eval.rs         #   memoized evaluator, built-in functions, cycle guard
+    src/sheet.rs        #   Sheet: sparse cell grid, set_input/set_formula
+    src/error.rs        #   EngineError (parse/build failures)
+    src/lib.rs          #   public re-exports
+  cli/                  # glasssheet-cli (binary `glasssheet`)
+    src/main.rs         #   CSV load -> evaluate -> table/CSV output
+examples/budget.csv     # sample spreadsheet with formulas
 ```
 
-That is the entire application. Three files.
+## How to run
 
-## How to Run
+```console
+cargo build
+cargo test                       # unit + doc tests
+cargo clippy --all-targets       # lint (CI runs with -D warnings)
+cargo fmt                        # format (CI runs --check)
+cargo run -p glasssheet-cli -- examples/budget.csv
+```
 
-1. Open `index.html` in any modern browser (Chrome, Firefox, Edge, Safari).
-2. Click "Download .xlsx" to get the 1040 template.
-3. Fill in tax data in Excel and save.
-4. Drag the file onto the upload area (or click to browse).
-5. Click "Download Tax Return PDF" to generate the return.
+## Architecture notes
 
-There is no build step, no dev server, and no dependencies to install. All libraries are loaded from CDN links in `index.html`.
+- **Values vs. errors.** A `Result::Err` (`EngineError`) means we couldn't build
+  the workbook (bad address/formula syntax). An *in-cell* error
+  (`Value::Error(CellError::…)`) is a value that propagates through formulas,
+  exactly like Excel's `#DIV/0!`. Don't conflate the two.
+- **Addressing is zero-based internally** (`CellRef { col, row }`); A1 syntax is
+  only the surface form. `$` absolute markers are preserved but don't affect
+  storage identity (cells are keyed by `(col, row)`).
+- **Evaluation is lazy + memoized** (`eval::evaluate_sheet`). An `in_progress`
+  set detects circular references and yields `CellError::Circular` instead of
+  recursing forever. There is no dependency graph yet — recompute is whole-sheet.
+- **`Sheet::set_input`** is the type-inference entry point: leading `=` →
+  formula, `TRUE`/`FALSE` → bool, numeric string → number, else text. Use it for
+  imported/user data. `set_value`/`set_formula` are the typed paths.
 
-## How It Works
+## Adding a built-in function
 
-### Template Generation (ExcelJS)
-- `downloadBtn` click handler creates an in-memory ExcelJS workbook.
-- Adds a "1040 Data Entry" sheet with 4 columns: Form Section, Line/Field Name, Value, Instructions.
-- Pre-fills 25 rows covering PERSONAL, ADDRESS, QUESTIONS, INCOME, DEDUCTIONS, and TAX/PAYMENTS sections.
-- Adds dropdown data validations for Filing Status (5 options) and Yes/No fields.
-- Exports as a downloadable `.xlsx` blob.
+1. Add a match arm in `eval.rs::eval_func` (function names are upper-cased before
+   dispatch — match on the upper-case name).
+2. Use the helpers: `collect_numbers` (range-flattening aggregation),
+   `scalar1`/`scalar2` (fixed numeric arity), `scalar_text1`, `flatten` (expand a
+   range arg to values). Propagate `Value::Error` early.
+3. Add a unit test in `eval.rs::tests` driving it through `set_input` + `get`.
+4. Document it in the README's function list.
 
-### File Upload (SheetJS)
-- Handles both `<input type="file">` and drag-and-drop.
-- Validates file type (.xlsx/.xls) and size (max 10MB).
-- Reads with `XLSX.read()`, converts first sheet to JSON with `XLSX.utils.sheet_to_json()`.
-- Parses rows into a `taxData` object keyed by "Line / Field Name".
-- Tracks missing fields in a `missingItems` array.
+## Conventions / gotchas
 
-### PDF Generation (jsPDF)
-- Creates an A4 portrait PDF formatted like a real Form 1040.
-- Sections: header with form number and year, filing status, personal info, income lines (1z through 7), calculated totals (Total Income, AGI, Taxable Income), payments/credits, and signature area.
-- Missing fields render as red `[ MISSING ]` with highlighted backgrounds.
-- Calculates: totalIncome, adjustments, AGI, deduction, taxableIncome.
-- Tax year is automatically set to `currentYear - 1`.
-
-## Code Style
-
-- Vanilla JavaScript with no framework.
-- All logic wrapped in a single `DOMContentLoaded` event listener.
-- CSS custom properties for theming (`--glass-bg`, `--neon-cyan`, `--neon-violet`).
-- Glassmorphism pattern: `backdrop-filter: blur(20px)`, translucent backgrounds, animated blob gradients.
-- Functions are declared inside the event listener scope (not global).
-- HTML escaping via `escapeHtml()` helper to prevent XSS in error messages.
-
-## Important Files -- Do Not Modify Carelessly
-
-- `index.html` lines 8-11 -- CDN script tags. Changing versions or removing them breaks all functionality.
-- `script.js` template rows (lines 51-78) -- These define the exact column names the parser expects. The upload parser reads `"Line / Field Name"` and `"Value"` columns by those exact header strings. Renaming headers in the template without updating the parser will silently break uploads.
-- `style.css` `.hidden` class -- Used by JS to toggle section visibility. Do not remove or rename.
-
-## Gotchas and Warnings
-
-- Do NOT add a bundler or build step unless you also update the CDN script tags to local imports. The current setup loads ExcelJS, SheetJS, jsPDF, and jsPDF-AutoTable from CDNs at runtime.
-- Do NOT change the Excel column headers ("Form Section", "Line / Field Name", "Value", "Instructions / Options") without updating `processTaxData()` in script.js. The parser uses those exact strings.
-- Do NOT rely on the `generatePdfBtn` click handler wired in `index.html` -- it gets re-wired dynamically after processing in `processTaxData()` because the success card HTML is replaced via innerHTML.
-- The standard deduction is hardcoded to $13,850 (2023 single). This needs annual updates.
-- The `TAX_YEAR` is computed as `new Date().getFullYear() - 1`. This is correct for typical filing but is not configurable.
-- There are no tests. If you add tests, consider using a browser-based runner (Playwright, Cypress) since the app depends on browser APIs (FileReader, Blob, DOM).
-- The body has `overflow: hidden` which prevents scrolling. On small screens, content may be clipped.
+- Keep the engine free of I/O and UI. File formats and presentation live in
+  front-end crates, not in `glasssheet-engine`.
+- Numbers render via `value::format_number` (no trailing `.0`, trims zeros).
+  Don't `format!("{}", n)` numbers ad hoc — reuse it for consistent output.
+- CSV cannot carry a comma inside an unquoted formula; quoted fields are required
+  for formulas like `"=ROUND(AVERAGE(A1:A3),2)"`. This is plain CSV semantics.
+- CI (`.github/workflows/ci.yml`) gates on `fmt --check`, `clippy -D warnings`,
+  and `cargo test --all`. Run all three locally before pushing.
+- There are no integration/GUI tests yet; logic is covered by `#[cfg(test)]`
+  modules in each engine file.
