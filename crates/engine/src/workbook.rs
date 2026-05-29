@@ -165,13 +165,10 @@ impl Workbook {
         Ok(())
     }
 
-    /// Evaluate every sheet, returning each sheet's computed grid keyed by
-    /// sheet name. (Cross-sheet references arrive in a later change.)
+    /// Evaluate every sheet, resolving cross-sheet references, and return each
+    /// sheet's computed grid keyed by sheet name.
     pub fn evaluate(&self) -> HashMap<String, HashMap<(u32, u32), Value>> {
-        self.sheets
-            .iter()
-            .map(|s| (s.name.clone(), s.evaluate()))
-            .collect()
+        crate::eval::evaluate_workbook(self)
     }
 
     fn ensure_unique(&self, name: &str, ignore: Option<usize>) -> Result<()> {

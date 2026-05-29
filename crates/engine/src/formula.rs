@@ -30,6 +30,10 @@ pub enum Expr {
     Bool(bool),
     Ref(CellRef),
     Range(CellRange),
+    /// A reference qualified by a sheet name (`Sheet2!A1`).
+    SheetRef(String, CellRef),
+    /// A range qualified by a sheet name (`Sheet2!A1:B3`).
+    SheetRange(String, CellRange),
     /// A bareword that isn't a recognized reference — a named range or an
     /// undefined name. Resolved (or rejected as `#NAME?`) at evaluation time.
     Name(String),
@@ -63,6 +67,10 @@ enum Token {
     Number(f64),
     Str(String),
     Word(String),
+    /// A single-quoted sheet name, e.g. `'My Sheet'`.
+    Quoted(String),
+    /// `!` — the sheet/reference separator.
+    Bang,
     Plus,
     Minus,
     Star,
@@ -133,6 +141,34 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
             ':' => {
                 tokens.push(Token::Colon);
                 i += 1;
+            }
+            '!' => {
+                tokens.push(Token::Bang);
+                i += 1;
+            }
+            '\'' => {
+                // Single-quoted sheet name with '' as an escaped quote.
+                let mut s = String::new();
+                i += 1;
+                loop {
+                    match chars.get(i) {
+                        None => return Err(EngineError::Syntax("unterminated sheet name".into())),
+                        Some('\'') => {
+                            if chars.get(i + 1) == Some(&'\'') {
+                                s.push('\'');
+                                i += 2;
+                            } else {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        Some(&ch) => {
+                            s.push(ch);
+                            i += 1;
+                        }
+                    }
+                }
+                tokens.push(Token::Quoted(s));
             }
             '=' => {
                 tokens.push(Token::Eq);
@@ -361,6 +397,11 @@ impl Parser {
                 Ok(inner)
             }
             Some(Token::Word(w)) => self.parse_word(w),
+            Some(Token::Quoted(name)) => {
+                // A quoted name is only meaningful as a sheet qualifier.
+                self.expect(&Token::Bang)?;
+                self.parse_sheet_qualified(name)
+            }
             other => Err(EngineError::Syntax(format!("unexpected token {other:?}"))),
         }
     }
@@ -373,6 +414,12 @@ impl Parser {
             let args = self.parse_args()?;
             self.expect(&Token::RParen)?;
             return Ok(Expr::Func(word.to_ascii_uppercase(), args));
+        }
+
+        // Sheet-qualified reference: WORD '!' ...
+        if self.peek() == Some(&Token::Bang) {
+            self.advance();
+            return self.parse_sheet_qualified(word);
         }
 
         // Range: WORD ':' WORD where both sides are references.
@@ -400,6 +447,33 @@ impl Parser {
                 Ok(r) => Ok(Expr::Ref(r)),
                 Err(_) => Ok(Expr::Name(word)),
             },
+        }
+    }
+
+    /// Parse the reference part of a sheet-qualified reference, with the `!`
+    /// already consumed. Produces a `SheetRef` or `SheetRange`.
+    fn parse_sheet_qualified(&mut self, sheet: String) -> Result<Expr> {
+        let start = match self.advance() {
+            Some(Token::Word(w)) => CellRef::parse(&w)?,
+            other => {
+                return Err(EngineError::Syntax(format!(
+                    "expected reference after '!', got {other:?}"
+                )))
+            }
+        };
+        if self.peek() == Some(&Token::Colon) {
+            self.advance();
+            match self.advance() {
+                Some(Token::Word(end_word)) => {
+                    let end = CellRef::parse(&end_word)?;
+                    Ok(Expr::SheetRange(sheet, CellRange::new(start, end)))
+                }
+                other => Err(EngineError::Syntax(format!(
+                    "expected reference after ':', got {other:?}"
+                ))),
+            }
+        } else {
+            Ok(Expr::SheetRef(sheet, start))
         }
     }
 
@@ -508,5 +582,46 @@ mod tests {
         assert!(parse("(1+2").is_err());
         assert!(parse("\"oops").is_err());
         assert!(parse("1 2").is_err());
+    }
+
+    #[test]
+    fn parses_sheet_qualified_ref_and_range() {
+        match p("Sheet2!A1") {
+            Expr::SheetRef(name, r) => {
+                assert_eq!(name, "Sheet2");
+                assert_eq!(r.to_a1(), "A1");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match p("Data!A1:B3") {
+            Expr::SheetRange(name, range) => {
+                assert_eq!(name, "Data");
+                assert_eq!(range.to_string(), "A1:B3");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_quoted_sheet_name() {
+        match p("'My Sheet'!B2") {
+            Expr::SheetRef(name, r) => {
+                assert_eq!(name, "My Sheet");
+                assert_eq!(r.to_a1(), "B2");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sheet_ref_inside_function() {
+        match p("SUM(Sheet2!A1:A3, B1)") {
+            Expr::Func(name, args) => {
+                assert_eq!(name, "SUM");
+                assert!(matches!(args[0], Expr::SheetRange(_, _)));
+                assert!(matches!(args[1], Expr::Ref(_)));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

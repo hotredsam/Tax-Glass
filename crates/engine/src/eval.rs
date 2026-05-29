@@ -1,40 +1,104 @@
-//! Formula evaluation over a [`Sheet`].
+//! Formula evaluation.
 //!
-//! Evaluation is lazy and memoized: each referenced cell is computed on demand
-//! and cached, and an in-progress set detects circular references (reported as
-//! the `#CIRC!` cell error rather than a panic or infinite loop).
+//! Evaluation is lazy and memoized. It runs against a [`Cells`] source — either
+//! a single [`Sheet`] or a whole [`Workbook`] — so the same evaluator resolves
+//! both same-sheet references and sheet-qualified ones (`Sheet2!A1`). An
+//! in-progress set keyed by `(sheet, col, row)` detects circular references
+//! (including cross-sheet cycles) and yields `#CIRC!` instead of recursing.
 
 use crate::formula::{BinOp, Expr};
 use crate::sheet::{CellContent, Sheet};
 use crate::value::{CellError, Value};
+use crate::workbook::Workbook;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-/// Compute the value of every populated cell in the sheet.
-pub fn evaluate_sheet(sheet: &Sheet) -> HashMap<(u32, u32), Value> {
-    let mut ev = Evaluator {
-        sheet,
-        cache: HashMap::new(),
-        in_progress: HashSet::new(),
-    };
-    let keys: Vec<(u32, u32)> = sheet.iter().map(|(k, _)| *k).collect();
-    for key in keys {
-        let v = ev.value_at(key.0, key.1);
-        ev.cache.insert(key, v);
+/// A source of cells the evaluator can read: maps sheet names to indices and
+/// hands back the content stored at any `(sheet, col, row)` coordinate.
+pub trait Cells {
+    /// Resolve a sheet name (case-insensitive) to its index.
+    fn sheet_index(&self, name: &str) -> Option<usize>;
+    /// The content stored at a coordinate, if any.
+    fn content(&self, sheet: usize, col: u32, row: u32) -> Option<&CellContent>;
+}
+
+impl Cells for Sheet {
+    fn sheet_index(&self, name: &str) -> Option<usize> {
+        if self.name.eq_ignore_ascii_case(name) {
+            Some(0)
+        } else {
+            None
+        }
     }
-    ev.cache
+
+    fn content(&self, sheet: usize, col: u32, row: u32) -> Option<&CellContent> {
+        if sheet == 0 {
+            Sheet::content(self, col, row)
+        } else {
+            None
+        }
+    }
+}
+
+impl Cells for Workbook {
+    fn sheet_index(&self, name: &str) -> Option<usize> {
+        self.index_of(name)
+    }
+
+    fn content(&self, sheet: usize, col: u32, row: u32) -> Option<&CellContent> {
+        self.sheet_at(sheet).and_then(|s| s.content(col, row))
+    }
+}
+
+/// Compute the value of every populated cell in a single sheet.
+pub fn evaluate_sheet(sheet: &Sheet) -> HashMap<(u32, u32), Value> {
+    let mut ev = Evaluator::new(sheet);
+    let keys: Vec<(u32, u32)> = sheet.iter().map(|(k, _)| *k).collect();
+    let mut out = HashMap::with_capacity(keys.len());
+    for (col, row) in keys {
+        out.insert((col, row), ev.value_at(0, col, row));
+    }
+    out
+}
+
+/// Compute every sheet of a workbook, resolving cross-sheet references. Returns
+/// each sheet's grid keyed by sheet name.
+pub fn evaluate_workbook(wb: &Workbook) -> HashMap<String, HashMap<(u32, u32), Value>> {
+    let mut ev = Evaluator::new(wb);
+    let mut out = HashMap::with_capacity(wb.len());
+    for (idx, sheet) in wb.sheets().iter().enumerate() {
+        let mut grid = HashMap::with_capacity(sheet.len());
+        for (&(col, row), _) in sheet.iter() {
+            grid.insert((col, row), ev.value_at(idx, col, row));
+        }
+        out.insert(sheet.name.clone(), grid);
+    }
+    out
 }
 
 struct Evaluator<'a> {
-    sheet: &'a Sheet,
-    cache: HashMap<(u32, u32), Value>,
-    in_progress: HashSet<(u32, u32)>,
+    cells: &'a dyn Cells,
+    /// Sheet index whose scope unqualified references resolve against.
+    current: usize,
+    cache: HashMap<(usize, u32, u32), Value>,
+    in_progress: HashSet<(usize, u32, u32)>,
 }
 
-impl Evaluator<'_> {
-    /// The computed value at a coordinate, with memoization and cycle guarding.
-    fn value_at(&mut self, col: u32, row: u32) -> Value {
-        let key = (col, row);
+impl<'a> Evaluator<'a> {
+    fn new(cells: &'a dyn Cells) -> Self {
+        Evaluator {
+            cells,
+            current: 0,
+            cache: HashMap::new(),
+            in_progress: HashSet::new(),
+        }
+    }
+
+    /// The computed value at a coordinate on a specific sheet, memoized and
+    /// cycle-guarded. Evaluating a formula switches the "current" sheet to the
+    /// cell's own sheet so its unqualified refs resolve locally.
+    fn value_at(&mut self, sheet: usize, col: u32, row: u32) -> Value {
+        let key = (sheet, col, row);
         if let Some(v) = self.cache.get(&key) {
             return v.clone();
         }
@@ -42,19 +106,27 @@ impl Evaluator<'_> {
             return Value::Error(CellError::Circular);
         }
 
-        let value = match self.sheet.content(col, row) {
+        let value = match self.cells.content(sheet, col, row) {
             None => Value::Empty,
             Some(CellContent::Literal(v)) => v.clone(),
             Some(CellContent::Formula { ast, .. }) => {
                 let ast = ast.clone();
+                let saved = self.current;
+                self.current = sheet;
                 self.in_progress.insert(key);
                 let v = self.eval(&ast);
                 self.in_progress.remove(&key);
+                self.current = saved;
                 v
             }
         };
         self.cache.insert(key, value.clone());
         value
+    }
+
+    /// Resolve a sheet name to its index, or `None` (→ `#REF!`).
+    fn sheet_index(&self, name: &str) -> Option<usize> {
+        self.cells.sheet_index(name)
     }
 
     /// Evaluate an expression to a scalar value.
@@ -63,9 +135,13 @@ impl Evaluator<'_> {
             Expr::Number(n) => Value::Number(*n),
             Expr::Text(t) => Value::Text(t.clone()),
             Expr::Bool(b) => Value::Bool(*b),
-            Expr::Ref(r) => self.value_at(r.col, r.row),
+            Expr::Ref(r) => self.value_at(self.current, r.col, r.row),
+            Expr::SheetRef(name, r) => match self.sheet_index(name) {
+                Some(idx) => self.value_at(idx, r.col, r.row),
+                None => Value::Error(CellError::Ref),
+            },
             // A bare range used as a scalar has no implicit intersection here.
-            Expr::Range(_) => Value::Error(CellError::Value),
+            Expr::Range(_) | Expr::SheetRange(_, _) => Value::Error(CellError::Value),
             Expr::Name(_) => Value::Error(CellError::Name),
             Expr::Neg(inner) => match self.eval(inner).as_number() {
                 Ok(n) => Value::Number(-n),
@@ -140,16 +216,23 @@ impl Evaluator<'_> {
     }
 
     /// Flatten a function argument into a list of scalar values, expanding
-    /// ranges cell-by-cell.
+    /// ranges (same-sheet or sheet-qualified) cell-by-cell.
     fn flatten(&mut self, expr: &Expr) -> Vec<Value> {
         match expr {
             Expr::Range(range) => {
-                let mut out = Vec::with_capacity(range.len());
-                for cell in range.cells() {
-                    out.push(self.value_at(cell.col, cell.row));
-                }
-                out
+                let sheet = self.current;
+                range
+                    .cells()
+                    .map(|c| self.value_at(sheet, c.col, c.row))
+                    .collect()
             }
+            Expr::SheetRange(name, range) => match self.sheet_index(name) {
+                Some(idx) => range
+                    .cells()
+                    .map(|c| self.value_at(idx, c.col, c.row))
+                    .collect(),
+                None => vec![Value::Error(CellError::Ref)],
+            },
             other => vec![self.eval(other)],
         }
     }
@@ -560,5 +643,61 @@ mod tests {
             ("A4", "=A3^2"),
         ]);
         assert_eq!(val(&s, "A4"), Value::Number(64.0));
+    }
+
+    #[test]
+    fn cross_sheet_reference_resolves() {
+        let mut wb = Workbook::empty();
+        wb.add_sheet("Data").unwrap();
+        let data = wb.sheet_mut("Data").unwrap();
+        data.set_input(r("A1"), "10").unwrap();
+        data.set_input(r("A2"), "20").unwrap();
+        wb.add_sheet("Calc").unwrap();
+        wb.sheet_mut("Calc")
+            .unwrap()
+            .set_formula(r("B1"), "=SUM(Data!A1:A2) + Data!A1")
+            .unwrap();
+
+        let all = evaluate_workbook(&wb);
+        assert_eq!(all["Calc"][&(1, 0)], Value::Number(40.0));
+    }
+
+    #[test]
+    fn reference_to_unknown_sheet_is_ref_error() {
+        let mut wb = Workbook::new();
+        wb.sheet_at_mut(0)
+            .unwrap()
+            .set_formula(r("A1"), "=Ghost!A1")
+            .unwrap();
+        let all = evaluate_workbook(&wb);
+        assert_eq!(all["Sheet1"][&(0, 0)], Value::Error(CellError::Ref));
+    }
+
+    #[test]
+    fn cross_sheet_cycle_is_detected() {
+        let mut wb = Workbook::empty();
+        wb.add_sheet("A").unwrap();
+        wb.add_sheet("B").unwrap();
+        wb.sheet_mut("A")
+            .unwrap()
+            .set_formula(r("A1"), "=B!A1")
+            .unwrap();
+        wb.sheet_mut("B")
+            .unwrap()
+            .set_formula(r("A1"), "=A!A1")
+            .unwrap();
+        let all = evaluate_workbook(&wb);
+        assert_eq!(all["A"][&(0, 0)], Value::Error(CellError::Circular));
+    }
+
+    #[test]
+    fn single_sheet_eval_still_works() {
+        // A sheet-qualified ref to the sheet's own name resolves; to others, #REF!.
+        let mut s = Sheet::new("Main");
+        s.set_input(r("A1"), "7").unwrap();
+        s.set_formula(r("A2"), "=Main!A1*2").unwrap();
+        s.set_formula(r("A3"), "=Other!A1").unwrap();
+        assert_eq!(val(&s, "A2"), Value::Number(14.0));
+        assert_eq!(val(&s, "A3"), Value::Error(CellError::Ref));
     }
 }
