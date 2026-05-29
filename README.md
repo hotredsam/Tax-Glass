@@ -26,9 +26,40 @@ glasssheet/
         sheet.rs        #   the worksheet (sparse cell grid)
     io/                 # glasssheet-io — file import/export (csv, xlsx, ods, …)
     cli/                # glasssheet-cli — command-line front-end (binary)
+    tui/                # glasssheet-tui — full-screen terminal editor (binary)
   examples/
     budget.csv          # sample spreadsheet with formulas
 ```
+
+## Terminal UI
+
+A full-screen interactive editor built on the engine:
+
+```console
+$ cargo run -p glasssheet-tui                 # blank workbook
+$ cargo run -p glasssheet-tui examples/budget.csv
+```
+
+```
+D2  =B2*C2
+         A         B         C         D         E
+   1 Item      Qty       Price
+   2 Widgets           4       2.5        10
+   3 Gadgets           3      9.99     29.97
+   4 Gizmos           10      1.25      12.5
+   5                                   52.47
+ ⠋ NORMAL  GlassSheet — arrows to move, Enter to edit, : for commands
+ Sheet1
+```
+
+- **Move** with arrow keys (Shift-arrow extends a selection; the status bar
+  shows Sum/Avg/Count). **Type** to edit a cell, **Enter** to commit, **Esc** to
+  cancel; **Delete** clears.
+- **Undo/redo** with Ctrl-Z / Ctrl-Y. **Tab / Shift-Tab** switch sheets.
+- **Commands** (press `:`): `:w file`, `:e file`, `:new [name]`, `:sheet name`,
+  `:theme Light|Dark|Glass`, `:q`.
+- Theme-aware colors, conditional-formatting highlights, and a subtly animated
+  cursor (~60 fps).
 
 ## Quick start
 

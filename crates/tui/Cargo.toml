@@ -1,0 +1,19 @@
+[package]
+name = "glasssheet-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Terminal UI front-end for GlassSheet: a full-screen spreadsheet editor."
+
+[[bin]]
+name = "glasssheet-tui"
+path = "src/main.rs"
+
+[dependencies]
+glasssheet-engine.workspace = true
+glasssheet-io.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+clap.workspace = true
