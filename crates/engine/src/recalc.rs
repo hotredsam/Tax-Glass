@@ -83,21 +83,21 @@ impl RecalcEngine {
         if self.dirty.is_empty() {
             return;
         }
-        let clean: HashMap<CellKey, Value> = self
-            .cache
-            .iter()
-            .filter(|(k, _)| !self.dirty.contains(*k))
-            .map(|(k, v)| (*k, v.clone()))
-            .collect();
-
-        let updates = evaluate_targets(&self.sheet, &clean, &self.dirty);
+        // Reuse the existing cache as the clean seed: drop the dirty entries (so
+        // they recompute) and let the evaluator borrow the rest — no O(n) copy.
+        let mut cache = std::mem::take(&mut self.cache);
+        for k in &self.dirty {
+            cache.remove(k);
+        }
+        let updates = evaluate_targets(&self.sheet, &cache, &self.dirty);
         for (k, v) in updates {
             if v == Value::Empty {
-                self.cache.remove(&k);
+                cache.remove(&k);
             } else {
-                self.cache.insert(k, v);
+                cache.insert(k, v);
             }
         }
+        self.cache = cache;
         self.dirty.clear();
     }
 

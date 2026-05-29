@@ -194,9 +194,7 @@ pub fn evaluate_targets(
     targets: &HashSet<(u32, u32)>,
 ) -> HashMap<(u32, u32), Value> {
     let mut ev = Evaluator::new(sheet);
-    for (&(col, row), v) in clean {
-        ev.cache.insert((0, col, row), v.clone());
-    }
+    ev.clean_seed = Some(clean);
     let mut out = HashMap::with_capacity(targets.len());
     for &(col, row) in targets {
         out.insert((col, row), ev.value_at(0, col, row));
@@ -294,6 +292,9 @@ struct Evaluator<'a> {
     /// previous iteration instead of recursing — so circular formulas advance
     /// one step per iteration rather than tripping the cycle guard.
     snapshot: Option<&'a HashMap<(usize, u32, u32), Value>>,
+    /// Already-computed *clean* values for sheet 0, borrowed (not copied) so an
+    /// incremental recalc reuses them in O(1) without seeding the cache.
+    clean_seed: Option<&'a HashMap<(u32, u32), Value>>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -304,6 +305,7 @@ impl<'a> Evaluator<'a> {
             cache: HashMap::new(),
             in_progress: HashSet::new(),
             snapshot: None,
+            clean_seed: None,
         }
     }
 
@@ -318,6 +320,7 @@ impl<'a> Evaluator<'a> {
             cache: HashMap::new(),
             in_progress: HashSet::new(),
             snapshot: Some(snapshot),
+            clean_seed: None,
         }
     }
 
@@ -332,6 +335,15 @@ impl<'a> Evaluator<'a> {
         }
         if let Some(v) = self.cache.get(&key) {
             return v.clone();
+        }
+        // Reuse already-computed clean values (incremental recalc) without
+        // copying them into the cache up front.
+        if sheet == 0 {
+            if let Some(seed) = self.clean_seed {
+                if let Some(v) = seed.get(&(col, row)) {
+                    return v.clone();
+                }
+            }
         }
         if self.in_progress.contains(&key) {
             return Value::Error(CellError::Circular);
