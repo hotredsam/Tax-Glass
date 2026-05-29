@@ -116,7 +116,7 @@ Building on the same engine:
 
 - ✅ Native `.xlsx` / `.xls` / `.xlsb` / `.ods` / `.csv` import; `.xlsx` / `.csv` export.
 - Native desktop GUI (grid editor) with glassmorphism theming.
-- Multi-sheet workbooks and cross-sheet references.
+- ✅ Multi-sheet workbooks (`Workbook`); cross-sheet references next.
 - A web build (WASM) and a mobile app.
 - A native GlassSheet document format.
 

@@ -22,9 +22,11 @@ pub mod eval;
 pub mod formula;
 pub mod sheet;
 pub mod value;
+pub mod workbook;
 
 pub use address::{CellRange, CellRef};
 pub use error::{EngineError, Result};
 pub use formula::{BinOp, Expr};
 pub use sheet::{CellContent, Sheet};
 pub use value::{CellError, Value};
+pub use workbook::Workbook;
