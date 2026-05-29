@@ -2,7 +2,7 @@
 //! line, and sheet tabs — all painted in the workbook's theme colors with a
 //! subtle animated cursor.
 
-use crate::app::{App, Mode};
+use crate::app::{App, Mode, Screen};
 use glasssheet_engine::address::index_to_column;
 use glasssheet_engine::style::Color as GColor;
 use glasssheet_engine::Value;
@@ -26,8 +26,16 @@ fn blend(a: GColor, b: GColor, t: f64) -> Color {
     Color::Rgb(lerp(a.r, b.r, t), lerp(a.g, b.g, t), lerp(a.b, b.b, t))
 }
 
-/// Draw the whole UI for one frame.
+/// Draw the whole UI for one frame, dispatching on the active screen.
 pub fn draw(f: &mut Frame, app: &mut App) {
+    match app.screen {
+        Screen::Grid => draw_grid_screen(f, app),
+        Screen::Sheets => draw_sheets(f, app),
+        Screen::Files => draw_files(f, app),
+    }
+}
+
+fn draw_grid_screen(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let rows = Layout::vertical([
         Constraint::Length(1), // formula bar
@@ -41,6 +49,106 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_grid(f, app, rows[1]);
     draw_status(f, app, rows[2]);
     draw_tabs(f, app, rows[3]);
+}
+
+/// A generic full-screen list overlay (title, highlighted rows, footer hint).
+fn draw_list_overlay(
+    f: &mut Frame,
+    app: &App,
+    title: &str,
+    items: Vec<(String, bool)>,
+    hint: &str,
+) {
+    let p = app.theme().palette.clone();
+    let area = f.area();
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+
+    let accent = *p.accents.first().unwrap_or(&p.selection);
+    f.render_widget(
+        Paragraph::new(format!(" {title}")).style(
+            Style::default()
+                .bg(col(accent))
+                .fg(col(p.background))
+                .add_modifier(Modifier::BOLD),
+        ),
+        rows[0],
+    );
+
+    let lines: Vec<Line> = items
+        .into_iter()
+        .map(|(text, selected)| {
+            let style = if selected {
+                Style::default()
+                    .bg(col(p.selection))
+                    .fg(col(p.foreground))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(col(p.background)).fg(col(p.foreground))
+            };
+            Line::from(Span::styled(format!(" {text}"), style))
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(col(p.background))),
+        rows[1],
+    );
+
+    f.render_widget(
+        Paragraph::new(format!(" {hint}"))
+            .style(Style::default().bg(col(p.header)).fg(col(p.foreground))),
+        rows[2],
+    );
+}
+
+fn draw_sheets(f: &mut Frame, app: &App) {
+    let items: Vec<(String, bool)> = app
+        .sheet_summaries()
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, cols, rows, cells, active))| {
+            let marker = if active { "●" } else { " " };
+            (
+                format!("{marker} {name:<24} {cols}×{rows}, {cells} cells"),
+                i == app.sheets_cursor,
+            )
+        })
+        .collect();
+    draw_list_overlay(
+        f,
+        app,
+        "My Sheets",
+        items,
+        "↑/↓ select   Enter open   Esc back",
+    );
+}
+
+fn draw_files(f: &mut Frame, app: &App) {
+    let items: Vec<(String, bool)> = app
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let label = if e.is_dir {
+                format!("[dir]  {}/", e.name)
+            } else {
+                format!("       {}", e.name)
+            };
+            (label, i == app.file_cursor)
+        })
+        .collect();
+    let title = format!("Open File — {}", app.cwd.display());
+    draw_list_overlay(
+        f,
+        app,
+        &title,
+        items,
+        "↑/↓ select   Enter open/descend   Esc cancel",
+    );
 }
 
 fn draw_formula_bar(f: &mut Frame, app: &App, area: Rect) {

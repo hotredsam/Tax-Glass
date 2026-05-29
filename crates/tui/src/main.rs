@@ -5,7 +5,7 @@
 mod app;
 mod ui;
 
-use app::{App, Mode};
+use app::{App, Mode, Screen};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
@@ -94,10 +94,36 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
 }
 
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    // Overlay screens capture keys regardless of edit mode.
+    match app.screen {
+        Screen::Sheets => return handle_sheets(app, code),
+        Screen::Files => return handle_files(app, code),
+        Screen::Grid => {}
+    }
     match app.mode {
         Mode::Normal => handle_normal(app, code, mods),
         Mode::Edit => handle_edit(app, code),
         Mode::Command => handle_command(app, code),
+    }
+}
+
+fn handle_sheets(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Up => app.sheets_move(-1),
+        KeyCode::Down => app.sheets_move(1),
+        KeyCode::Enter => app.sheets_select(),
+        KeyCode::Esc => app.close_overlay(),
+        _ => {}
+    }
+}
+
+fn handle_files(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Up => app.files_move(-1),
+        KeyCode::Down => app.files_move(1),
+        KeyCode::Enter => app.files_enter(),
+        KeyCode::Esc => app.close_overlay(),
+        _ => {}
     }
 }
 
@@ -119,6 +145,8 @@ fn handle_normal(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::BackTab => app.prev_sheet(),
         KeyCode::Delete | KeyCode::Backspace => app.clear_cell(),
         KeyCode::Enter | KeyCode::F(2) => app.begin_edit(),
+        KeyCode::F(3) => app.open_files(),
+        KeyCode::F(4) => app.open_sheets(),
         KeyCode::Char(':') => app.begin_command(),
         KeyCode::Char(c) => {
             // Typing a character starts replacing the cell (Excel behavior).

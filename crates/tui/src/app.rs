@@ -21,6 +21,36 @@ pub enum Mode {
     Command,
 }
 
+/// Which screen the UI is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    /// The cell grid.
+    Grid,
+    /// The "My Sheets" overview.
+    Sheets,
+    /// The file-open browser.
+    Files,
+}
+
+/// An entry in the file browser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEntry {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+/// File extensions the browser offers to open.
+const SUPPORTED_EXTS: &[&str] = &[
+    "csv", "tsv", "txt", "xlsx", "xlsm", "xlsb", "xls", "ods", "json", "md", "markdown", "html",
+    "htm",
+];
+
+fn is_supported(name: &str) -> bool {
+    name.rsplit_once('.')
+        .map(|(_, ext)| SUPPORTED_EXTS.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 /// A single undoable cell edit.
 struct Edit {
     sheet: usize,
@@ -47,6 +77,17 @@ pub struct App {
     pub tick: u64,
     pub quit: bool,
 
+    /// Which screen is visible.
+    pub screen: Screen,
+    /// Cursor on the "My Sheets" page.
+    pub sheets_cursor: usize,
+    /// Current directory shown in the file browser.
+    pub cwd: std::path::PathBuf,
+    /// Entries shown in the file browser.
+    pub entries: Vec<FileEntry>,
+    /// Cursor in the file browser.
+    pub file_cursor: usize,
+
     undo: Vec<Edit>,
     redo: Vec<Edit>,
     computed: HashMap<(u32, u32), Value>,
@@ -71,6 +112,11 @@ impl App {
             status: "GlassSheet — arrows to move, Enter to edit, : for commands".into(),
             tick: 0,
             quit: false,
+            screen: Screen::Grid,
+            sheets_cursor: 0,
+            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            entries: Vec::new(),
+            file_cursor: 0,
             undo: Vec::new(),
             redo: Vec::new(),
             computed: HashMap::new(),
@@ -312,6 +358,136 @@ impl App {
         self.recompute();
     }
 
+    // --- My Sheets overview ---
+
+    /// Open the "My Sheets" page, pointing the cursor at the active sheet.
+    pub fn open_sheets(&mut self) {
+        self.sheets_cursor = self.wb.active_index();
+        self.screen = Screen::Sheets;
+    }
+
+    /// Move the sheets cursor, wrapping around.
+    pub fn sheets_move(&mut self, delta: i64) {
+        let n = self.wb.len();
+        if n == 0 {
+            return;
+        }
+        self.sheets_cursor = (self.sheets_cursor as i64 + delta).rem_euclid(n as i64) as usize;
+    }
+
+    /// Open the sheet under the sheets cursor and return to the grid.
+    pub fn sheets_select(&mut self) {
+        if self.wb.set_active(self.sheets_cursor).is_ok() {
+            self.goto(0, 0);
+            self.recompute();
+        }
+        self.screen = Screen::Grid;
+    }
+
+    /// Per-sheet `(name, cols, rows, populated cells, active?)` for the page.
+    pub fn sheet_summaries(&self) -> Vec<(String, u32, u32, usize, bool)> {
+        let active = self.wb.active_index();
+        self.wb
+            .sheets()
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let (cols, rows) = s.dimensions();
+                (s.name.clone(), cols, rows, s.len(), i == active)
+            })
+            .collect()
+    }
+
+    // --- file-open browser ---
+
+    /// Open the file browser in the current working directory.
+    pub fn open_files(&mut self) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        self.browse_dir(cwd);
+        self.screen = Screen::Files;
+    }
+
+    /// Point the browser at a directory and reload its entries.
+    pub fn browse_dir(&mut self, dir: std::path::PathBuf) {
+        self.cwd = dir;
+        self.load_entries();
+        self.file_cursor = 0;
+    }
+
+    fn load_entries(&mut self) {
+        let mut entries = Vec::new();
+        if self.cwd.parent().is_some() {
+            entries.push(FileEntry {
+                name: "..".into(),
+                is_dir: true,
+            });
+        }
+        match std::fs::read_dir(&self.cwd) {
+            Ok(rd) => {
+                let mut items: Vec<FileEntry> = rd
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if name.starts_with('.') {
+                            return None; // hide dotfiles
+                        }
+                        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                        if is_dir || is_supported(&name) {
+                            Some(FileEntry { name, is_dir })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                // Directories first, then files, each alphabetical.
+                items.sort_by(|a, b| {
+                    (!a.is_dir, a.name.to_lowercase()).cmp(&(!b.is_dir, b.name.to_lowercase()))
+                });
+                entries.extend(items);
+            }
+            Err(e) => self.status = format!("cannot read {}: {e}", self.cwd.display()),
+        }
+        self.entries = entries;
+        if self.file_cursor >= self.entries.len() {
+            self.file_cursor = self.entries.len().saturating_sub(1);
+        }
+    }
+
+    /// Move the file-browser cursor, clamped.
+    pub fn files_move(&mut self, delta: i64) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let max = self.entries.len() as i64 - 1;
+        self.file_cursor = (self.file_cursor as i64 + delta).clamp(0, max) as usize;
+    }
+
+    /// Act on the selected entry: descend into a directory, or open a file.
+    pub fn files_enter(&mut self) {
+        let Some(entry) = self.entries.get(self.file_cursor).cloned() else {
+            return;
+        };
+        if entry.is_dir {
+            let target = if entry.name == ".." {
+                self.cwd.parent().map(|p| p.to_path_buf())
+            } else {
+                Some(self.cwd.join(&entry.name))
+            };
+            if let Some(dir) = target {
+                self.browse_dir(dir);
+            }
+        } else {
+            let path = self.cwd.join(&entry.name);
+            self.open(&path.to_string_lossy());
+            self.screen = Screen::Grid;
+        }
+    }
+
+    /// Close any overlay screen and return to the grid.
+    pub fn close_overlay(&mut self) {
+        self.screen = Screen::Grid;
+    }
+
     // --- commands (`:w file`, `:e file`, `:q`, `:sheet name`, `:theme name`) ---
 
     /// Run the command currently in the buffer; returns to Normal mode.
@@ -326,6 +502,8 @@ impl App {
             "w" | "write" | "save" => self.save(arg),
             "e" | "o" | "open" | "edit" => self.open(arg),
             "sheet" | "s" => self.select_sheet(arg),
+            "sheets" | "ls" => self.open_sheets(),
+            "files" | "browse" => self.open_files(),
             "new" => self.new_sheet(arg),
             "theme" => self.set_theme(arg),
             "" => {}
@@ -482,6 +660,57 @@ mod tests {
         app.buffer = "theme Glass".into();
         app.run_command();
         assert_eq!(app.theme().name, "Glass");
+    }
+
+    #[test]
+    fn my_sheets_page_navigates_and_selects() {
+        let mut app = App::new(Workbook::new());
+        app.buffer = "new Budget".into();
+        app.run_command(); // active is now Budget (index 1)
+        app.open_sheets();
+        assert_eq!(app.screen, Screen::Sheets);
+        assert_eq!(app.sheets_cursor, 1);
+        app.sheets_move(-1); // to Sheet1
+        app.sheets_select();
+        assert_eq!(app.screen, Screen::Grid);
+        assert_eq!(app.active().name, "Sheet1");
+        // Summaries report every sheet, flagging the active one.
+        let summaries = app.sheet_summaries();
+        assert_eq!(summaries.len(), 2);
+        assert!(summaries
+            .iter()
+            .any(|(n, _, _, _, active)| n == "Sheet1" && *active));
+    }
+
+    #[test]
+    fn file_browser_lists_and_opens() {
+        // Build a temp dir with a CSV and a subdirectory.
+        let dir = std::env::temp_dir().join(format!("glasssheet_fb_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(dir.join("sub"));
+        std::fs::write(dir.join("data.csv"), "a,b\n1,2\n").unwrap();
+        std::fs::write(dir.join("ignore.bin"), "x").unwrap();
+
+        let mut app = App::new(Workbook::new());
+        app.browse_dir(dir.clone());
+        // ".." + "sub/" + "data.csv"; the unsupported .bin is filtered out.
+        let names: Vec<&str> = app.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&".."));
+        assert!(names.contains(&"sub"));
+        assert!(names.contains(&"data.csv"));
+        assert!(!names.contains(&"ignore.bin"));
+
+        // Move to the csv and open it.
+        let idx = app
+            .entries
+            .iter()
+            .position(|e| e.name == "data.csv")
+            .unwrap();
+        app.file_cursor = idx;
+        app.files_enter();
+        assert_eq!(app.screen, Screen::Grid);
+        assert_eq!(app.value_at(0, 1), Value::Number(1.0)); // A2 == 1
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
