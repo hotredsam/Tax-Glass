@@ -658,6 +658,26 @@ impl<'a> Evaluator<'a> {
             "ROUND" => self.round_family(args, RoundMode::Half),
             "ROUNDUP" => self.round_family(args, RoundMode::Up),
             "ROUNDDOWN" => self.round_family(args, RoundMode::Down),
+            // --- integer / combinatorial math ---
+            "GCD" => self.func_gcd(args),
+            "LCM" => self.func_lcm(args),
+            "FACT" => self.scalar1(args, fact_value),
+            "FACTDOUBLE" => self.scalar1(args, factdouble_value),
+            "COMBIN" => self.scalar2(args, |n, k| combin_value(n, k, false)),
+            "COMBINA" => self.scalar2(args, |n, k| combin_value(n, k, true)),
+            "PERMUT" => self.scalar2(args, permut_value),
+            "PERMUTATIONA" => self.scalar2(args, |n, k| Value::Number(n.trunc().powf(k.trunc()))),
+            "QUOTIENT" => self.scalar2(args, |a, b| {
+                if b == 0.0 {
+                    Value::Error(CellError::Div0)
+                } else {
+                    Value::Number((a / b).trunc())
+                }
+            }),
+            "ROMAN" => self.scalar1(args, roman_value),
+            "ARABIC" => self.scalar_text1(args, arabic_value),
+            "BASE" => self.func_base(args),
+            "DECIMAL" => self.func_decimal(args),
             "MROUND" => self.scalar2(args, |n, m| {
                 if m == 0.0 {
                     Value::Number(0.0)
@@ -840,6 +860,76 @@ impl<'a> Evaluator<'a> {
                     Value::Number(sum / count as f64)
                 }
             }
+        }
+    }
+
+    fn func_gcd(&mut self, args: &[Expr]) -> Value {
+        match self.collect_numbers(args) {
+            Err(e) => Value::Error(e),
+            Ok(ns) if ns.is_empty() || ns.iter().any(|n| *n < 0.0) => Value::Error(CellError::Num),
+            Ok(ns) => {
+                let g = ns.iter().fold(0u64, |acc, n| gcd(acc, n.trunc() as u64));
+                Value::Number(g as f64)
+            }
+        }
+    }
+
+    fn func_lcm(&mut self, args: &[Expr]) -> Value {
+        match self.collect_numbers(args) {
+            Err(e) => Value::Error(e),
+            Ok(ns) if ns.is_empty() || ns.iter().any(|n| *n < 0.0) => Value::Error(CellError::Num),
+            Ok(ns) => {
+                let mut l = 1u64;
+                for n in ns {
+                    let v = n.trunc() as u64;
+                    if v == 0 {
+                        return Value::Number(0.0);
+                    }
+                    l = l / gcd(l, v) * v;
+                }
+                Value::Number(l as f64)
+            }
+        }
+    }
+
+    /// BASE(number, radix, [min_length]) → string in the given radix.
+    fn func_base(&mut self, args: &[Expr]) -> Value {
+        if args.len() < 2 || args.len() > 3 {
+            return Value::Error(CellError::Value);
+        }
+        let n = match self.eval(&args[0]).as_number() {
+            Ok(n) if n >= 0.0 => n.trunc() as u64,
+            _ => return Value::Error(CellError::Num),
+        };
+        let radix = match self.eval(&args[1]).as_number() {
+            Ok(r) if (2.0..=36.0).contains(&r) => r as u32,
+            _ => return Value::Error(CellError::Num),
+        };
+        let min_len = if args.len() == 3 {
+            self.eval(&args[2]).as_number().unwrap_or(0.0).max(0.0) as usize
+        } else {
+            0
+        };
+        let mut s = to_radix(n, radix);
+        while s.len() < min_len {
+            s.insert(0, '0');
+        }
+        Value::Text(s)
+    }
+
+    /// DECIMAL(text, radix) → number parsed from the given radix.
+    fn func_decimal(&mut self, args: &[Expr]) -> Value {
+        if args.len() != 2 {
+            return Value::Error(CellError::Value);
+        }
+        let text = self.eval(&args[0]).as_text();
+        let radix = match self.eval(&args[1]).as_number() {
+            Ok(r) if (2.0..=36.0).contains(&r) => r as u32,
+            _ => return Value::Error(CellError::Num),
+        };
+        match u64::from_str_radix(text.trim(), radix) {
+            Ok(n) => Value::Number(n as f64),
+            Err(_) => Value::Error(CellError::Num),
         }
     }
 
@@ -1162,6 +1252,159 @@ enum IfsKind {
     Count,
 }
 
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
+/// Guard a computed float result: `#NUM!` if it isn't finite (overflow).
+fn finite_num(v: f64) -> Value {
+    if v.is_finite() {
+        Value::Number(v)
+    } else {
+        Value::Error(CellError::Num)
+    }
+}
+
+fn fact_value(n: f64) -> Value {
+    let n = n.trunc();
+    if n < 0.0 {
+        return Value::Error(CellError::Num);
+    }
+    let mut acc = 1.0;
+    let mut i = 2.0;
+    while i <= n {
+        acc *= i;
+        i += 1.0;
+    }
+    finite_num(acc)
+}
+
+fn factdouble_value(n: f64) -> Value {
+    let n = n.trunc();
+    if n < -1.0 {
+        return Value::Error(CellError::Num);
+    }
+    let mut acc = 1.0;
+    let mut i = n;
+    while i > 1.0 {
+        acc *= i;
+        i -= 2.0;
+    }
+    finite_num(acc)
+}
+
+/// COMBIN(n,k) or COMBINA(n,k) (combinations with repetition).
+fn combin_value(n: f64, k: f64, with_repetition: bool) -> Value {
+    let (n, k) = (n.trunc() as i64, k.trunc() as i64);
+    if n < 0 || k < 0 {
+        return Value::Error(CellError::Num);
+    }
+    let (n, k) = if with_repetition {
+        (n + k - 1, k)
+    } else {
+        (n, k)
+    };
+    if k > n {
+        return Value::Error(CellError::Num);
+    }
+    // Multiplicative formula to limit overflow.
+    let k = k.min(n - k);
+    let mut acc = 1.0;
+    for i in 0..k {
+        acc = acc * (n - i) as f64 / (i + 1) as f64;
+    }
+    finite_num(acc.round())
+}
+
+fn permut_value(n: f64, k: f64) -> Value {
+    let (n, k) = (n.trunc() as i64, k.trunc() as i64);
+    if n < 0 || k < 0 || k > n {
+        return Value::Error(CellError::Num);
+    }
+    let mut acc = 1.0;
+    for i in 0..k {
+        acc *= (n - i) as f64;
+    }
+    finite_num(acc)
+}
+
+const ROMAN_TABLE: &[(u32, &str)] = &[
+    (1000, "M"),
+    (900, "CM"),
+    (500, "D"),
+    (400, "CD"),
+    (100, "C"),
+    (90, "XC"),
+    (50, "L"),
+    (40, "XL"),
+    (10, "X"),
+    (9, "IX"),
+    (5, "V"),
+    (4, "IV"),
+    (1, "I"),
+];
+
+fn roman_value(n: f64) -> Value {
+    let n = n.trunc();
+    if !(0.0..=3999.0).contains(&n) {
+        return Value::Error(CellError::Value);
+    }
+    let mut remaining = n as u32;
+    let mut out = String::new();
+    for &(value, sym) in ROMAN_TABLE {
+        while remaining >= value {
+            out.push_str(sym);
+            remaining -= value;
+        }
+    }
+    Value::Text(out)
+}
+
+fn arabic_value(s: &str) -> Value {
+    let s = s.trim().to_ascii_uppercase();
+    let digit = |c: char| match c {
+        'I' => Some(1),
+        'V' => Some(5),
+        'X' => Some(10),
+        'L' => Some(50),
+        'C' => Some(100),
+        'D' => Some(500),
+        'M' => Some(1000),
+        _ => None,
+    };
+    let vals: Vec<i64> = match s.chars().map(digit).collect::<Option<Vec<_>>>() {
+        Some(v) => v,
+        None => return Value::Error(CellError::Value),
+    };
+    let mut total = 0i64;
+    for i in 0..vals.len() {
+        if i + 1 < vals.len() && vals[i] < vals[i + 1] {
+            total -= vals[i];
+        } else {
+            total += vals[i];
+        }
+    }
+    Value::Number(total as f64)
+}
+
+fn to_radix(mut n: u64, radix: u32) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    let digits = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut out = Vec::new();
+    while n > 0 {
+        out.push(digits[(n % radix as u64) as usize]);
+        n /= radix as u64;
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap()
+}
+
 /// Return `Number(value)` when `in_domain`, else a `#NUM!` error.
 fn domain_num(in_domain: bool, value: f64) -> Value {
     if in_domain {
@@ -1402,6 +1645,34 @@ mod tests {
             ("A4", "=A3^2"),
         ]);
         assert_eq!(val(&s, "A4"), Value::Number(64.0));
+    }
+
+    #[test]
+    fn integer_and_numeral_functions() {
+        let s = sheet_with(&[
+            ("A1", "=GCD(12,18)"),
+            ("A2", "=LCM(4,6)"),
+            ("A3", "=FACT(5)"),
+            ("A4", "=COMBIN(5,2)"),
+            ("A5", "=PERMUT(5,2)"),
+            ("A6", "=QUOTIENT(17,5)"),
+            ("A7", "=ROMAN(2024)"),
+            ("A8", "=ARABIC(\"MMXXIV\")"),
+            ("A9", "=BASE(255,16)"),
+            ("A10", "=DECIMAL(\"FF\",16)"),
+            ("A11", "=FACTDOUBLE(7)"),
+        ]);
+        assert_eq!(val(&s, "A1"), Value::Number(6.0));
+        assert_eq!(val(&s, "A2"), Value::Number(12.0));
+        assert_eq!(val(&s, "A3"), Value::Number(120.0));
+        assert_eq!(val(&s, "A4"), Value::Number(10.0));
+        assert_eq!(val(&s, "A5"), Value::Number(20.0));
+        assert_eq!(val(&s, "A6"), Value::Number(3.0));
+        assert_eq!(val(&s, "A7"), Value::Text("MMXXIV".into()));
+        assert_eq!(val(&s, "A8"), Value::Number(2024.0));
+        assert_eq!(val(&s, "A9"), Value::Text("FF".into()));
+        assert_eq!(val(&s, "A10"), Value::Number(255.0));
+        assert_eq!(val(&s, "A11"), Value::Number(105.0)); // 7*5*3*1
     }
 
     #[test]
