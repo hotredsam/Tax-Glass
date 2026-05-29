@@ -61,6 +61,26 @@ pub fn evaluate_sheet(sheet: &Sheet) -> HashMap<(u32, u32), Value> {
     out
 }
 
+/// Incrementally evaluate a set of target cells on a single sheet, seeding the
+/// evaluator's cache with already-known *clean* values so untouched precedents
+/// are reused instead of recomputed. Returns the freshly computed value for
+/// each target. Used by [`crate::recalc::RecalcEngine`].
+pub fn evaluate_targets(
+    sheet: &Sheet,
+    clean: &HashMap<(u32, u32), Value>,
+    targets: &HashSet<(u32, u32)>,
+) -> HashMap<(u32, u32), Value> {
+    let mut ev = Evaluator::new(sheet);
+    for (&(col, row), v) in clean {
+        ev.cache.insert((0, col, row), v.clone());
+    }
+    let mut out = HashMap::with_capacity(targets.len());
+    for &(col, row) in targets {
+        out.insert((col, row), ev.value_at(0, col, row));
+    }
+    out
+}
+
 /// Compute every sheet of a workbook, resolving cross-sheet references. Returns
 /// each sheet's grid keyed by sheet name.
 pub fn evaluate_workbook(wb: &Workbook) -> HashMap<String, HashMap<(u32, u32), Value>> {
