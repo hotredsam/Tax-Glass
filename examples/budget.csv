@@ -1,0 +1,6 @@
+Item,Qty,Price,Total
+Widgets,4,2.50,=B2*C2
+Gadgets,3,9.99,=B3*C3
+Gizmos,10,1.25,=B4*C4
+,,Grand Total,=SUM(D2:D4)
+,,Average,"=ROUND(AVERAGE(D2:D4),2)"
