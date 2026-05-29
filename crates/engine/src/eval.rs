@@ -658,6 +658,30 @@ impl<'a> Evaluator<'a> {
             "ROUND" => self.round_family(args, RoundMode::Half),
             "ROUNDUP" => self.round_family(args, RoundMode::Up),
             "ROUNDDOWN" => self.round_family(args, RoundMode::Down),
+            // --- random ---
+            "RAND" => {
+                if args.is_empty() {
+                    Value::Number(next_rand())
+                } else {
+                    Value::Error(CellError::Value)
+                }
+            }
+            "RANDBETWEEN" => self.scalar2(args, |lo, hi| {
+                let lo = lo.ceil();
+                let hi = hi.floor();
+                if hi < lo {
+                    Value::Error(CellError::Num)
+                } else {
+                    let span = hi - lo + 1.0;
+                    Value::Number(lo + (next_rand() * span).floor())
+                }
+            }),
+            // --- central tendency / dispersion ---
+            "MEDIAN" => self.stat_median(args),
+            "MODE" | "MODE.SNGL" => self.stat_mode(args),
+            "GEOMEAN" => self.stat_geomean(args),
+            "HARMEAN" => self.stat_harmean(args),
+            "TRIMMEAN" => self.func_trimmean(args),
             // --- integer / combinatorial math ---
             "GCD" => self.func_gcd(args),
             "LCM" => self.func_lcm(args),
@@ -861,6 +885,94 @@ impl<'a> Evaluator<'a> {
                 }
             }
         }
+    }
+
+    fn sorted_numbers(&mut self, args: &[Expr]) -> Result<Vec<f64>, CellError> {
+        let mut ns = self.collect_numbers(args)?;
+        ns.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(ns)
+    }
+
+    fn stat_median(&mut self, args: &[Expr]) -> Value {
+        match self.sorted_numbers(args) {
+            Err(e) => Value::Error(e),
+            Ok(ns) if ns.is_empty() => Value::Error(CellError::Num),
+            Ok(ns) => {
+                let mid = ns.len() / 2;
+                let m = if ns.len() % 2 == 0 {
+                    (ns[mid - 1] + ns[mid]) / 2.0
+                } else {
+                    ns[mid]
+                };
+                Value::Number(m)
+            }
+        }
+    }
+
+    fn stat_mode(&mut self, args: &[Expr]) -> Value {
+        match self.collect_numbers(args) {
+            Err(e) => Value::Error(e),
+            Ok(ns) => {
+                let mut best: Option<(f64, usize)> = None;
+                for (i, &n) in ns.iter().enumerate() {
+                    let count = ns[i..].iter().filter(|&&x| x == n).count()
+                        + ns[..i].iter().filter(|&&x| x == n).count();
+                    if count > 1 && best.map(|(_, c)| count > c).unwrap_or(true) {
+                        best = Some((n, count));
+                    }
+                }
+                match best {
+                    Some((n, _)) => Value::Number(n),
+                    None => Value::Error(CellError::NA),
+                }
+            }
+        }
+    }
+
+    fn stat_geomean(&mut self, args: &[Expr]) -> Value {
+        match self.collect_numbers(args) {
+            Err(e) => Value::Error(e),
+            Ok(ns) if ns.is_empty() || ns.iter().any(|n| *n <= 0.0) => Value::Error(CellError::Num),
+            Ok(ns) => {
+                let sum_ln: f64 = ns.iter().map(|n| n.ln()).sum();
+                Value::Number((sum_ln / ns.len() as f64).exp())
+            }
+        }
+    }
+
+    fn stat_harmean(&mut self, args: &[Expr]) -> Value {
+        match self.collect_numbers(args) {
+            Err(e) => Value::Error(e),
+            Ok(ns) if ns.is_empty() || ns.iter().any(|n| *n <= 0.0) => Value::Error(CellError::Num),
+            Ok(ns) => {
+                let sum_recip: f64 = ns.iter().map(|n| 1.0 / n).sum();
+                Value::Number(ns.len() as f64 / sum_recip)
+            }
+        }
+    }
+
+    /// TRIMMEAN(data, percent): mean after trimming `percent` of values split
+    /// evenly between the high and low ends.
+    fn func_trimmean(&mut self, args: &[Expr]) -> Value {
+        if args.len() != 2 {
+            return Value::Error(CellError::Value);
+        }
+        let percent = match self.eval(&args[1]).as_number() {
+            Ok(p) if (0.0..1.0).contains(&p) => p,
+            _ => return Value::Error(CellError::Num),
+        };
+        let ns = match self.sorted_numbers(&args[..1]) {
+            Ok(ns) if !ns.is_empty() => ns,
+            Ok(_) => return Value::Error(CellError::Num),
+            Err(e) => return Value::Error(e),
+        };
+        // Trim an even count from each end.
+        let trim = ((ns.len() as f64 * percent) / 2.0).floor() as usize;
+        let slice = &ns[trim..ns.len() - trim];
+        if slice.is_empty() {
+            return Value::Error(CellError::Num);
+        }
+        Value::Number(slice.iter().sum::<f64>() / slice.len() as f64)
     }
 
     fn func_gcd(&mut self, args: &[Expr]) -> Value {
@@ -1250,6 +1362,33 @@ enum IfsKind {
     Sum,
     Average,
     Count,
+}
+
+thread_local! {
+    /// Per-thread xorshift state for the volatile RAND family, seeded once from
+    /// the wall clock so values differ between runs.
+    static RNG_STATE: std::cell::Cell<u64> = std::cell::Cell::new(rng_seed());
+}
+
+fn rng_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    nanos | 1 // never zero
+}
+
+/// A uniform random `f64` in `[0, 1)`.
+fn next_rand() -> f64 {
+    RNG_STATE.with(|s| {
+        let mut x = s.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        (x >> 11) as f64 / (1u64 << 53) as f64
+    })
 }
 
 fn gcd(a: u64, b: u64) -> u64 {
@@ -1645,6 +1784,34 @@ mod tests {
             ("A4", "=A3^2"),
         ]);
         assert_eq!(val(&s, "A4"), Value::Number(64.0));
+    }
+
+    #[test]
+    fn random_and_statistics() {
+        let s = sheet_with(&[
+            ("A1", "1"),
+            ("A2", "2"),
+            ("A3", "2"),
+            ("A4", "4"),
+            ("A5", "100"),
+            ("B1", "=MEDIAN(A1:A5)"),
+            ("B2", "=MODE(A1:A5)"),
+            ("B3", "=GEOMEAN(A1:A4)"),
+            ("B4", "=HARMEAN(1,2,4)"),
+            ("B5", "=TRIMMEAN(A1:A5, 0.4)"),
+            ("B6", "=RAND()"),
+            ("B7", "=RANDBETWEEN(1,6)"),
+        ]);
+        assert_eq!(val(&s, "B1"), Value::Number(2.0)); // sorted 1,2,2,4,100 -> 2
+        assert_eq!(val(&s, "B2"), Value::Number(2.0)); // most frequent
+        assert!((val(&s, "B3").as_number().unwrap() - 2.0).abs() < 1e-9); // (1*2*2*4)^(1/4)=2
+        assert!((val(&s, "B4").as_number().unwrap() - 12.0 / 7.0).abs() < 1e-9);
+        // 5 values, 40% trim -> drop 1 from each end -> mean of 2,2,4
+        assert!((val(&s, "B5").as_number().unwrap() - 8.0 / 3.0).abs() < 1e-9);
+        let rand = val(&s, "B6").as_number().unwrap();
+        assert!((0.0..1.0).contains(&rand));
+        let between = val(&s, "B7").as_number().unwrap();
+        assert!((1.0..=6.0).contains(&between) && between.fract() == 0.0);
     }
 
     #[test]
