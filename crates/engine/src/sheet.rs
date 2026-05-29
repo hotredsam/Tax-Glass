@@ -161,6 +161,19 @@ impl Sheet {
         self.cells.get(&(col, row))
     }
 
+    /// Replace a cell's exact content (or clear it with `None`). Used by the
+    /// undo system to restore a precise prior state without re-inferring types.
+    pub fn set_content(&mut self, r: CellRef, content: Option<CellContent>) {
+        match content {
+            Some(c) => {
+                self.cells.insert((r.col, r.row), c);
+            }
+            None => {
+                self.cells.remove(&(r.col, r.row));
+            }
+        }
+    }
+
     /// Set the visual style of a cell. Setting the default style clears it.
     pub fn set_style(&mut self, r: CellRef, style: CellStyle) {
         if style.is_default() {
