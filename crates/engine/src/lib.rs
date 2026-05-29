@@ -39,7 +39,7 @@ pub use eval::{evaluate_sheet_iterative, evaluate_workbook, Cells};
 pub use format::format_value;
 pub use formula::{BinOp, Expr};
 pub use recalc::RecalcEngine;
-pub use sheet::{CellContent, Sheet};
+pub use sheet::{CellContent, Comment, Sheet};
 pub use style::{Alignment, Border, BorderStyle, Borders, CellStyle, Color, Font, HAlign, VAlign};
 pub use validation::{Validation, ValidationRule};
 pub use value::{CellError, Value};

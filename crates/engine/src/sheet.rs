@@ -52,6 +52,31 @@ pub enum CellContent {
     Formula { src: String, ast: Expr },
 }
 
+/// A note attached to a cell.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Comment {
+    pub author: Option<String>,
+    pub text: String,
+}
+
+impl Comment {
+    /// A comment with text and no author.
+    pub fn new(text: impl Into<String>) -> Self {
+        Comment {
+            author: None,
+            text: text.into(),
+        }
+    }
+
+    /// A comment attributed to an author.
+    pub fn by(author: impl Into<String>, text: impl Into<String>) -> Self {
+        Comment {
+            author: Some(author.into()),
+            text: text.into(),
+        }
+    }
+}
+
 /// A worksheet. Cells are keyed by zero-based `(col, row)`; absolute markers on
 /// references don't affect storage identity.
 #[derive(Debug, Clone)]
@@ -61,6 +86,7 @@ pub struct Sheet {
     styles: HashMap<(u32, u32), CellStyle>,
     cond_rules: Vec<Rule>,
     validations: Vec<Validation>,
+    comments: HashMap<(u32, u32), Comment>,
 }
 
 impl Sheet {
@@ -72,6 +98,7 @@ impl Sheet {
             styles: HashMap::new(),
             cond_rules: Vec::new(),
             validations: Vec::new(),
+            comments: HashMap::new(),
         }
     }
 
@@ -169,6 +196,21 @@ impl Sheet {
     pub fn conditional_styles(&self) -> HashMap<(u32, u32), CellStyle> {
         let computed = self.evaluate();
         crate::condformat::effective_styles(&self.cond_rules, &computed)
+    }
+
+    /// Attach (or replace) a comment on a cell.
+    pub fn set_comment(&mut self, r: CellRef, comment: Comment) {
+        self.comments.insert((r.col, r.row), comment);
+    }
+
+    /// The comment on a cell, if any.
+    pub fn comment(&self, r: CellRef) -> Option<&Comment> {
+        self.comments.get(&(r.col, r.row))
+    }
+
+    /// Remove and return a cell's comment.
+    pub fn remove_comment(&mut self, r: CellRef) -> Option<Comment> {
+        self.comments.remove(&(r.col, r.row))
     }
 
     /// Attach a data-validation rule to a range.
@@ -314,6 +356,14 @@ impl Sheet {
         for (key, style) in old_styles {
             if let Some(new_key) = reposition(key, axis, &edit) {
                 self.styles.insert(new_key, style);
+            }
+        }
+
+        // Comments move with their cells too.
+        let old_comments = std::mem::take(&mut self.comments);
+        for (key, comment) in old_comments {
+            if let Some(new_key) = reposition(key, axis, &edit) {
+                self.comments.insert(new_key, comment);
             }
         }
     }
@@ -651,6 +701,26 @@ mod tests {
         // A cell without a number format displays its general value.
         s.set_input(cell("A2"), "5").unwrap();
         assert_eq!(s.display(cell("A2")), "5");
+    }
+
+    #[test]
+    fn comments_attach_move_and_clear() {
+        let mut s = Sheet::new("Sheet1");
+        s.set_comment(cell("B2"), Comment::by("Ada", "check this"));
+        assert_eq!(s.comment(cell("B2")).unwrap().text, "check this");
+        assert_eq!(
+            s.comment(cell("B2")).unwrap().author.as_deref(),
+            Some("Ada")
+        );
+
+        // A column insert shifts the comment from B2 to C2.
+        s.insert_cols(0, 1);
+        assert!(s.comment(cell("B2")).is_none());
+        assert_eq!(s.comment(cell("C2")).unwrap().text, "check this");
+
+        let removed = s.remove_comment(cell("C2"));
+        assert!(removed.is_some());
+        assert!(s.comment(cell("C2")).is_none());
     }
 
     #[test]
