@@ -98,6 +98,9 @@ the file:
 | `.xlsb` | ✅ | — |
 | `.xls` | ✅ | — |
 | `.ods` | ✅ | — |
+| `.json` | ✅ | ✅ |
+| `.md` (Markdown table) | ✅ | ✅ |
+| `.html` (table) | ✅ | ✅ |
 
 Reading preserves stored formulas where the source file provides them; XLSX
 export writes a real, editable workbook with formulas kept live. Convert between

@@ -22,13 +22,178 @@ pub fn import_path(path: impl AsRef<Path>) -> Result<Sheet> {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    if ext == "csv" || ext == "tsv" || ext == "txt" {
-        import_csv(path)
-    } else if CALAMINE_EXTS.contains(&ext.as_str()) {
-        import_spreadsheet(path)
-    } else {
-        Err(IoError::UnsupportedFormat(ext))
+    match ext.as_str() {
+        "csv" | "tsv" | "txt" => import_csv(path),
+        "json" => import_json(path),
+        "md" | "markdown" => import_markdown(path),
+        "html" | "htm" => import_html(path),
+        e if CALAMINE_EXTS.contains(&e) => import_spreadsheet(path),
+        _ => Err(IoError::UnsupportedFormat(ext)),
     }
+}
+
+/// Build a sheet from a row-major grid of cell strings, inferring each type.
+fn sheet_from_rows(name: &str, rows: &[Vec<String>]) -> Result<Sheet> {
+    let mut sheet = Sheet::new(name);
+    for (r, row) in rows.iter().enumerate() {
+        for (c, field) in row.iter().enumerate() {
+            if field.is_empty() {
+                continue;
+            }
+            sheet.set_input(CellRef::new(c as u32, r as u32), field)?;
+        }
+    }
+    Ok(sheet)
+}
+
+fn stem(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Sheet1")
+        .to_string()
+}
+
+/// Import a JSON document of the shape written by `export_json`
+/// (`{"rows": [[...], ...]}`) or a bare array of arrays.
+pub fn import_json(path: impl AsRef<Path>) -> Result<Sheet> {
+    use serde_json::Value as J;
+    let path = path.as_ref();
+    let text = std::fs::read_to_string(path)?;
+    let doc: J = serde_json::from_str(&text).map_err(|e| IoError::Csv(e.to_string()))?;
+    let (name, rows_json) = match doc {
+        J::Object(mut map) => {
+            let name = map
+                .get("sheet")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| stem(path));
+            let rows = map.remove("rows").unwrap_or(J::Array(vec![]));
+            (name, rows)
+        }
+        other => (stem(path), other),
+    };
+    let arr = rows_json
+        .as_array()
+        .ok_or_else(|| IoError::Csv("expected an array of rows".into()))?;
+    let rows: Vec<Vec<String>> = arr
+        .iter()
+        .map(|row| {
+            row.as_array()
+                .map(|cells| cells.iter().map(json_cell_to_string).collect())
+                .unwrap_or_default()
+        })
+        .collect();
+    sheet_from_rows(&name, &rows)
+}
+
+fn json_cell_to_string(v: &serde_json::Value) -> String {
+    use serde_json::Value as J;
+    match v {
+        J::Null => String::new(),
+        J::Bool(b) => b.to_string().to_uppercase(),
+        J::Number(n) => n.to_string(),
+        J::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Import a Markdown table (the first table found). The separator row
+/// (`|---|`) is skipped.
+pub fn import_markdown(path: impl AsRef<Path>) -> Result<Sheet> {
+    let path = path.as_ref();
+    let text = std::fs::read_to_string(path)?;
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.contains('|') {
+            if rows.is_empty() {
+                continue;
+            } else {
+                break; // table ended
+            }
+        }
+        let cells = split_md_row(trimmed);
+        // Skip the header separator row (all cells are dashes/colons).
+        if cells
+            .iter()
+            .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
+        {
+            continue;
+        }
+        rows.push(cells);
+    }
+    sheet_from_rows(&stem(path), &rows)
+}
+
+fn split_md_row(line: &str) -> Vec<String> {
+    let line = line.trim().trim_start_matches('|').trim_end_matches('|');
+    line.split('|')
+        .map(|c| c.trim().replace("\\|", "|"))
+        .collect()
+}
+
+/// Import the first `<table>` from an HTML document. A lightweight scan handles
+/// the tables we (and most tools) emit; it is not a full HTML parser.
+pub fn import_html(path: impl AsRef<Path>) -> Result<Sheet> {
+    let path = path.as_ref();
+    let text = std::fs::read_to_string(path)?;
+    let lower = text.to_lowercase();
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut search = 0;
+    while let Some(tr_start) = lower[search..].find("<tr").map(|i| i + search) {
+        let row_end = lower[tr_start..]
+            .find("</tr>")
+            .map(|i| i + tr_start)
+            .unwrap_or(text.len());
+        let row_html = &text[tr_start..row_end];
+        let mut cells = Vec::new();
+        let lower_row = row_html.to_lowercase();
+        let mut pos = 0;
+        while let Some(open) = next_cell_open(&lower_row, pos) {
+            // Skip to the end of the opening tag.
+            let content_start = lower_row[open..].find('>').map(|i| open + i + 1);
+            let Some(cs) = content_start else { break };
+            let close = lower_row[cs..]
+                .find("</td>")
+                .or_else(|| lower_row[cs..].find("</th>"))
+                .map(|i| cs + i)
+                .unwrap_or(row_html.len());
+            cells.push(strip_tags(&row_html[cs..close]));
+            pos = close + 1;
+        }
+        if !cells.is_empty() {
+            rows.push(cells);
+        }
+        search = row_end + 5;
+    }
+    sheet_from_rows(&stem(path), &rows)
+}
+
+fn next_cell_open(lower_row: &str, from: usize) -> Option<usize> {
+    let td = lower_row[from..].find("<td").map(|i| i + from);
+    let th = lower_row[from..].find("<th").map(|i| i + from);
+    match (td, th) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Strip HTML tags and unescape the handful of entities we emit.
+fn strip_tags(s: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim()
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 /// Read a CSV/TSV file into a sheet, inferring each cell's type.

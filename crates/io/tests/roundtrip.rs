@@ -66,3 +66,67 @@ fn unsupported_extension_is_rejected() {
     let err = export_path(&sample_sheet(), &path).unwrap_err();
     assert!(matches!(err, glasssheet_io::IoError::UnsupportedFormat(_)));
 }
+
+/// A grid of computed values used by the text-format round-trips.
+fn grid_sheet() -> Sheet {
+    let mut s = Sheet::new("Data");
+    let rows = [["Item", "Qty"], ["Apples", "3"], ["Pears", "5"]];
+    for (r, [a, b]) in rows.iter().enumerate() {
+        s.set_input(CellRef::new(0, r as u32), a).unwrap();
+        s.set_input(CellRef::new(1, r as u32), b).unwrap();
+    }
+    s
+}
+
+#[test]
+fn json_roundtrip() {
+    let path = std::env::temp_dir().join("glasssheet_rt.json");
+    export_path(&grid_sheet(), &path).unwrap();
+    let reloaded = import_path(&path).unwrap();
+    assert_eq!(reloaded.get(cell("A2")), Value::Text("Apples".into()));
+    assert_eq!(reloaded.get(cell("B3")), Value::Number(5.0));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn markdown_roundtrip() {
+    let path = std::env::temp_dir().join("glasssheet_rt.md");
+    export_path(&grid_sheet(), &path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("| Item | Qty |"));
+    assert!(text.contains("| --- | --- |"));
+    let reloaded = import_path(&path).unwrap();
+    assert_eq!(reloaded.get(cell("A1")), Value::Text("Item".into()));
+    assert_eq!(reloaded.get(cell("B2")), Value::Number(3.0));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn html_roundtrip() {
+    let path = std::env::temp_dir().join("glasssheet_rt.html");
+    export_path(&grid_sheet(), &path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("<th>Item</th>"));
+    assert!(text.contains("<td>Apples</td>"));
+    let reloaded = import_path(&path).unwrap();
+    assert_eq!(reloaded.get(cell("A1")), Value::Text("Item".into()));
+    assert_eq!(reloaded.get(cell("B3")), Value::Number(5.0));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn html_import_handles_external_tables() {
+    let path = std::env::temp_dir().join("glasssheet_ext.html");
+    std::fs::write(
+        &path,
+        "<html><body><table>\
+         <tr><th>Name</th><th>Score</th></tr>\
+         <tr><td>Ada</td><td>99</td></tr>\
+         </table></body></html>",
+    )
+    .unwrap();
+    let s = import_path(&path).unwrap();
+    assert_eq!(s.get(cell("A1")), Value::Text("Name".into()));
+    assert_eq!(s.get(cell("B2")), Value::Number(99.0));
+    let _ = std::fs::remove_file(&path);
+}

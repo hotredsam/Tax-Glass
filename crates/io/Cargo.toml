@@ -12,4 +12,5 @@ glasssheet-engine.workspace = true
 calamine.workspace = true
 rust_xlsxwriter.workspace = true
 csv.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true

@@ -585,6 +585,7 @@ dependencies = [
  "csv",
  "glasssheet-engine",
  "rust_xlsxwriter",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 
