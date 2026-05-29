@@ -30,6 +30,11 @@ pub trait Cells {
         let _ = sheet;
         (0, 0)
     }
+    /// Look up a cached AI/model result for a prompt. `None` (the default) means
+    /// "not cached" and surfaces as `#N/A` until a refresh populates it.
+    fn ai_lookup(&self, _prompt: &str) -> Option<Value> {
+        None
+    }
 }
 
 impl Cells for Sheet {
@@ -751,6 +756,60 @@ impl<'a> Evaluator<'a> {
             "LOWER" => self.scalar_text1(args, |s| Value::Text(s.to_lowercase())),
             "TRIM" => self.scalar_text1(args, |s| Value::Text(s.trim().to_string())),
 
+            // --- GlassSheet extensions (not in Excel) ---
+            // COMPARE(a, b): -1 if a<b, 0 if equal, 1 if a>b (Excel has no
+            // single ordering function).
+            "COMPARE" => {
+                if args.len() != 2 {
+                    return Value::Error(CellError::Value);
+                }
+                let a = self.eval(&args[0]);
+                let b = self.eval(&args[1]);
+                if let Value::Error(e) = a {
+                    return Value::Error(e);
+                }
+                if let Value::Error(e) = b {
+                    return Value::Error(e);
+                }
+                Value::Number(match compare_values(&a, &b) {
+                    Ordering::Less => -1.0,
+                    Ordering::Equal => 0.0,
+                    Ordering::Greater => 1.0,
+                })
+            }
+            // SIMILARITY(text1, text2): 0..1 fuzzy match (1 - normalized edit
+            // distance). Handy for de-duping and reconciliation.
+            "SIMILARITY" => {
+                if args.len() != 2 {
+                    return Value::Error(CellError::Value);
+                }
+                let a = self.eval(&args[0]);
+                let b = self.eval(&args[1]);
+                if let Value::Error(e) = a {
+                    return Value::Error(e);
+                }
+                if let Value::Error(e) = b {
+                    return Value::Error(e);
+                }
+                Value::Number(similarity(&a.as_text(), &b.as_text()))
+            }
+            // AI(prompt, [hint]): result of an AI/model call, served from the
+            // workbook's refreshable cache. Returns #N/A while a result is
+            // pending a refresh (see crate::ai).
+            "AI" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Value::Error(CellError::Value);
+                }
+                let prompt = self.eval(&args[0]);
+                if let Value::Error(e) = prompt {
+                    return Value::Error(e);
+                }
+                match self.cells.ai_lookup(&prompt.as_text()) {
+                    Some(v) => v,
+                    None => Value::Error(CellError::NA),
+                }
+            }
+
             _ => Value::Error(CellError::Name),
         }
     }
@@ -1364,6 +1423,34 @@ enum IfsKind {
     Count,
 }
 
+/// Normalized string similarity in `[0, 1]`: `1 - editDistance/maxLen`,
+/// case-insensitive. Two empty strings are perfectly similar.
+fn similarity(a: &str, b: &str) -> f64 {
+    let a: Vec<char> = a.to_lowercase().chars().collect();
+    let b: Vec<char> = b.to_lowercase().chars().collect();
+    let max = a.len().max(b.len());
+    if max == 0 {
+        return 1.0;
+    }
+    let dist = levenshtein(&a, &b);
+    1.0 - dist as f64 / max as f64
+}
+
+/// Levenshtein edit distance between two char slices.
+fn levenshtein(a: &[char], b: &[char]) -> usize {
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 thread_local! {
     /// Per-thread xorshift state for the volatile RAND family, seeded once from
     /// the wall clock so values differ between runs.
@@ -1784,6 +1871,33 @@ mod tests {
             ("A4", "=A3^2"),
         ]);
         assert_eq!(val(&s, "A4"), Value::Number(64.0));
+    }
+
+    #[test]
+    fn compare_and_similarity_extensions() {
+        let s = sheet_with(&[
+            ("A1", "=COMPARE(3,5)"),
+            ("A2", "=COMPARE(5,5)"),
+            ("A3", "=COMPARE(9,5)"),
+            ("A4", "=SIMILARITY(\"kitten\",\"kitten\")"),
+            ("A5", "=SIMILARITY(\"kitten\",\"sitting\")"),
+            ("A6", "=SIMILARITY(\"abc\",\"xyz\")"),
+        ]);
+        assert_eq!(val(&s, "A1"), Value::Number(-1.0));
+        assert_eq!(val(&s, "A2"), Value::Number(0.0));
+        assert_eq!(val(&s, "A3"), Value::Number(1.0));
+        assert_eq!(val(&s, "A4"), Value::Number(1.0));
+        // kitten->sitting is edit distance 3 over length 7.
+        let sim = val(&s, "A5").as_number().unwrap();
+        assert!((sim - (1.0 - 3.0 / 7.0)).abs() < 1e-9);
+        assert_eq!(val(&s, "A6"), Value::Number(0.0));
+    }
+
+    #[test]
+    fn ai_function_pending_without_cache() {
+        // With no AI cache wired in (a bare Sheet), AI(...) is pending → #N/A.
+        let s = sheet_with(&[("A1", "=AI(\"summarize sales\")")]);
+        assert_eq!(val(&s, "A1"), Value::Error(CellError::NA));
     }
 
     #[test]
