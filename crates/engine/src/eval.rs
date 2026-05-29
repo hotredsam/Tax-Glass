@@ -109,6 +109,71 @@ pub fn evaluate_targets(
     out
 }
 
+/// Evaluate a single sheet in **iterative mode**, allowing intentional circular
+/// references to converge. Formula cells start at 0 and are recomputed from the
+/// previous iteration's snapshot until the largest numeric change drops below
+/// `epsilon` or `max_iterations` is reached.
+pub fn evaluate_sheet_iterative(
+    sheet: &Sheet,
+    max_iterations: u32,
+    epsilon: f64,
+) -> HashMap<(u32, u32), Value> {
+    use crate::sheet::CellContent;
+
+    // Seed: literals at their value, formula cells at 0.
+    let mut snapshot: HashMap<(usize, u32, u32), Value> = HashMap::new();
+    let mut formula_keys: Vec<(u32, u32)> = Vec::new();
+    for (&(col, row), content) in sheet.iter() {
+        match content {
+            CellContent::Literal(v) => {
+                snapshot.insert((0, col, row), v.clone());
+            }
+            CellContent::Formula { .. } => {
+                snapshot.insert((0, col, row), Value::Number(0.0));
+                formula_keys.push((col, row));
+            }
+        }
+    }
+
+    for _ in 0..max_iterations.max(1) {
+        let mut next = snapshot.clone();
+        let mut max_delta = 0.0_f64;
+        for &(col, row) in &formula_keys {
+            let new_val = match sheet.content(col, row) {
+                Some(CellContent::Formula { ast, .. }) => {
+                    let ast = ast.clone();
+                    let mut ev = Evaluator::with_snapshot(sheet, 0, &snapshot);
+                    ev.eval(&ast)
+                }
+                _ => Value::Empty,
+            };
+            let old = snapshot.get(&(0, col, row));
+            max_delta = max_delta.max(numeric_delta(old, &new_val));
+            next.insert((0, col, row), new_val);
+        }
+        snapshot = next;
+        if max_delta < epsilon {
+            break;
+        }
+    }
+
+    snapshot
+        .into_iter()
+        .map(|((_, col, row), v)| ((col, row), v))
+        .collect()
+}
+
+/// Magnitude of change between two values for convergence testing. Numeric
+/// changes use the absolute difference; any non-numeric change (or appearance)
+/// counts as infinite so iteration continues.
+fn numeric_delta(old: Option<&Value>, new: &Value) -> f64 {
+    match (old, new) {
+        (Some(Value::Number(a)), Value::Number(b)) => (a - b).abs(),
+        (Some(o), n) if o == n => 0.0,
+        _ => f64::INFINITY,
+    }
+}
+
 /// Compute every sheet of a workbook, resolving cross-sheet references. Returns
 /// each sheet's grid keyed by sheet name.
 pub fn evaluate_workbook(wb: &Workbook) -> HashMap<String, HashMap<(u32, u32), Value>> {
@@ -130,6 +195,10 @@ struct Evaluator<'a> {
     current: usize,
     cache: HashMap<(usize, u32, u32), Value>,
     in_progress: HashSet<(usize, u32, u32)>,
+    /// In iterative mode, references read from this fixed snapshot of the
+    /// previous iteration instead of recursing — so circular formulas advance
+    /// one step per iteration rather than tripping the cycle guard.
+    snapshot: Option<&'a HashMap<(usize, u32, u32), Value>>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -139,6 +208,21 @@ impl<'a> Evaluator<'a> {
             current: 0,
             cache: HashMap::new(),
             in_progress: HashSet::new(),
+            snapshot: None,
+        }
+    }
+
+    fn with_snapshot(
+        cells: &'a dyn Cells,
+        current: usize,
+        snapshot: &'a HashMap<(usize, u32, u32), Value>,
+    ) -> Self {
+        Evaluator {
+            cells,
+            current,
+            cache: HashMap::new(),
+            in_progress: HashSet::new(),
+            snapshot: Some(snapshot),
         }
     }
 
@@ -147,6 +231,10 @@ impl<'a> Evaluator<'a> {
     /// cell's own sheet so its unqualified refs resolve locally.
     fn value_at(&mut self, sheet: usize, col: u32, row: u32) -> Value {
         let key = (sheet, col, row);
+        // Iterative mode: read the previous iteration's value, no recursion.
+        if let Some(snap) = self.snapshot {
+            return snap.get(&key).cloned().unwrap_or(Value::Empty);
+        }
         if let Some(v) = self.cache.get(&key) {
             return v.clone();
         }
@@ -735,6 +823,26 @@ mod tests {
             ("A4", "=A3^2"),
         ]);
         assert_eq!(val(&s, "A4"), Value::Number(64.0));
+    }
+
+    #[test]
+    fn iterative_mode_converges_a_feedback_loop() {
+        // A1 = A1/2 + 5 has fixed point 10. Batch eval would report #CIRC!.
+        let mut s = Sheet::new("Sheet1");
+        s.set_formula(r("A1"), "=A1/2 + 5").unwrap();
+        assert_eq!(s.get(r("A1")), Value::Error(CellError::Circular));
+
+        let result = s.evaluate_iterative(100, 1e-9);
+        let v = result[&(0, 0)].as_number().unwrap();
+        assert!((v - 10.0).abs() < 1e-6, "converged to {v}, expected ~10");
+    }
+
+    #[test]
+    fn iterative_mode_matches_acyclic_results() {
+        let s = sheet_with(&[("A1", "3"), ("A2", "=A1*2"), ("A3", "=A2+A1")]);
+        let result = s.evaluate_iterative(50, 1e-9);
+        assert_eq!(result[&(0, 1)], Value::Number(6.0));
+        assert_eq!(result[&(0, 2)], Value::Number(9.0));
     }
 
     #[test]

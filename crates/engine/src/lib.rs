@@ -31,7 +31,7 @@ pub mod workbook;
 pub use address::{CellRange, CellRef};
 pub use deps::{CellKey, DependencyGraph};
 pub use error::{EngineError, Result};
-pub use eval::{evaluate_workbook, Cells};
+pub use eval::{evaluate_sheet_iterative, evaluate_workbook, Cells};
 pub use format::format_value;
 pub use formula::{BinOp, Expr};
 pub use recalc::RecalcEngine;

@@ -247,6 +247,18 @@ impl Sheet {
         evaluate_sheet(self)
     }
 
+    /// Evaluate in iterative mode, letting intentional circular references
+    /// converge. Formula cells start at 0 and are recomputed until the largest
+    /// numeric change is below `epsilon` or `max_iterations` is hit. Use this
+    /// instead of [`Sheet::evaluate`] when a model relies on feedback loops.
+    pub fn evaluate_iterative(
+        &self,
+        max_iterations: u32,
+        epsilon: f64,
+    ) -> HashMap<(u32, u32), Value> {
+        crate::eval::evaluate_sheet_iterative(self, max_iterations, epsilon)
+    }
+
     /// Convenience: the computed value at a single reference.
     pub fn get(&self, r: CellRef) -> Value {
         self.evaluate()
