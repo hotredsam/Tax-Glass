@@ -30,6 +30,7 @@ pub mod style;
 pub mod undo;
 pub mod validation;
 pub mod value;
+pub mod view;
 pub mod workbook;
 
 pub use address::{CellRange, CellRef};
@@ -45,4 +46,5 @@ pub use style::{Alignment, Border, BorderStyle, Borders, CellStyle, Color, Font,
 pub use undo::History;
 pub use validation::{Validation, ValidationRule};
 pub use value::{CellError, Value};
+pub use view::ViewState;
 pub use workbook::{DefinedName, Workbook};

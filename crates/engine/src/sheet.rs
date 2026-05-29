@@ -9,6 +9,7 @@ use crate::formula::{self, Expr};
 use crate::style::CellStyle;
 use crate::validation::Validation;
 use crate::value::Value;
+use crate::view::ViewState;
 use std::collections::HashMap;
 
 /// Which axis a structural edit applies to.
@@ -87,6 +88,7 @@ pub struct Sheet {
     cond_rules: Vec<Rule>,
     validations: Vec<Validation>,
     comments: HashMap<(u32, u32), Comment>,
+    view: ViewState,
 }
 
 impl Sheet {
@@ -99,6 +101,7 @@ impl Sheet {
             cond_rules: Vec::new(),
             validations: Vec::new(),
             comments: HashMap::new(),
+            view: ViewState::default(),
         }
     }
 
@@ -209,6 +212,21 @@ impl Sheet {
     pub fn conditional_styles(&self) -> HashMap<(u32, u32), CellStyle> {
         let computed = self.evaluate();
         crate::condformat::effective_styles(&self.cond_rules, &computed)
+    }
+
+    /// The sheet's view state (frozen panes, zoom, selection).
+    pub fn view(&self) -> &ViewState {
+        &self.view
+    }
+
+    /// Mutable access to the view state.
+    pub fn view_mut(&mut self) -> &mut ViewState {
+        &mut self.view
+    }
+
+    /// Convenience: freeze `rows` rows and `cols` columns.
+    pub fn freeze_panes(&mut self, rows: u32, cols: u32) {
+        self.view.freeze(rows, cols);
     }
 
     /// Attach (or replace) a comment on a cell.
@@ -714,6 +732,17 @@ mod tests {
         // A cell without a number format displays its general value.
         s.set_input(cell("A2"), "5").unwrap();
         assert_eq!(s.display(cell("A2")), "5");
+    }
+
+    #[test]
+    fn view_state_freeze_and_selection() {
+        let mut s = Sheet::new("Sheet1");
+        assert!(!s.view().is_frozen());
+        s.freeze_panes(1, 2);
+        assert!(s.view().is_frozen());
+        assert_eq!((s.view().frozen_rows, s.view().frozen_cols), (1, 2));
+        s.view_mut().selection = Some(CellRange::parse("A1:B3").unwrap());
+        assert_eq!(s.view().selection.unwrap().to_string(), "A1:B3");
     }
 
     #[test]
