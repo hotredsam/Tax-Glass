@@ -37,6 +37,9 @@ pub enum Expr {
     /// A bareword that isn't a recognized reference — a named range or an
     /// undefined name. Resolved (or rejected as `#NAME?`) at evaluation time.
     Name(String),
+    /// A reference that was invalidated by a structural edit (a deleted row or
+    /// column). Evaluates to `#REF!`, mirroring Excel.
+    RefError,
     Neg(Box<Expr>),
     /// Postfix `%` — divides by 100.
     Percent(Box<Expr>),
@@ -56,6 +59,99 @@ pub fn parse(input: &str) -> Result<Expr> {
         )));
     }
     Ok(expr)
+}
+
+/// Render an expression back to formula text (without the leading `=`).
+///
+/// Output re-parses to an equivalent AST. Parenthesization is conservative
+/// (a sub-expression is wrapped whenever its binding is not strictly tighter
+/// than its parent's), so the result is always correct, if occasionally more
+/// parenthesized than a human would write.
+pub fn unparse(expr: &Expr) -> String {
+    render(expr, 0)
+}
+
+/// Binding strength used only for unparsing. Higher binds tighter.
+fn precedence(expr: &Expr) -> u8 {
+    match expr {
+        Expr::Binary(op, _, _) => match op {
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => 1,
+            BinOp::Concat => 2,
+            BinOp::Add | BinOp::Sub => 3,
+            BinOp::Mul | BinOp::Div => 4,
+            BinOp::Pow => 5,
+        },
+        Expr::Neg(_) => 6,
+        Expr::Percent(_) => 7,
+        _ => u8::MAX, // atoms
+    }
+}
+
+fn render(expr: &Expr, parent: u8) -> String {
+    let prec = precedence(expr);
+    let body = match expr {
+        Expr::Number(n) => crate::value::format_number(*n),
+        Expr::Text(t) => format!("\"{}\"", t.replace('"', "\"\"")),
+        Expr::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+        Expr::Ref(r) => r.to_a1(),
+        Expr::Range(range) => range.to_string(),
+        Expr::SheetRef(sheet, r) => format!("{}!{}", quote_sheet(sheet), r.to_a1()),
+        Expr::SheetRange(sheet, range) => format!("{}!{}", quote_sheet(sheet), range),
+        Expr::Name(name) => name.clone(),
+        Expr::RefError => "#REF!".to_string(),
+        Expr::Neg(inner) => format!("-{}", render(inner, prec)),
+        Expr::Percent(inner) => format!("{}%", render(inner, prec)),
+        Expr::Binary(op, lhs, rhs) => {
+            format!(
+                "{}{}{}",
+                render(lhs, prec),
+                binop_str(*op),
+                render(rhs, prec)
+            )
+        }
+        Expr::Func(name, args) => {
+            let rendered: Vec<String> = args.iter().map(|a| render(a, 0)).collect();
+            format!("{}({})", name, rendered.join(","))
+        }
+    };
+    // Wrap when this node binds no tighter than its parent.
+    if prec <= parent {
+        format!("({body})")
+    } else {
+        body
+    }
+}
+
+fn binop_str(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Eq => "=",
+        BinOp::Ne => "<>",
+        BinOp::Lt => "<",
+        BinOp::Gt => ">",
+        BinOp::Le => "<=",
+        BinOp::Ge => ">=",
+        BinOp::Concat => "&",
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Pow => "^",
+    }
+}
+
+/// Quote a sheet name for output if it isn't a bare identifier.
+fn quote_sheet(name: &str) -> String {
+    let simple = !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if simple {
+        name.to_string()
+    } else {
+        format!("'{}'", name.replace('\'', "''"))
+    }
 }
 
 // ----------------------------------------------------------------------------

@@ -1,12 +1,45 @@
 //! A single worksheet: a sparse grid of cells, each holding either a literal
 //! value or a parsed formula.
 
-use crate::address::CellRef;
+use crate::address::{CellRange, CellRef};
 use crate::error::Result;
 use crate::eval::evaluate_sheet;
 use crate::formula::{self, Expr};
 use crate::value::Value;
 use std::collections::HashMap;
+
+/// Which axis a structural edit applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Axis {
+    Row,
+    Col,
+}
+
+/// A structural edit: inserting or deleting `count` rows/columns at index `at`.
+#[derive(Debug, Clone, Copy)]
+enum Edit {
+    Insert { at: u32, count: u32 },
+    Delete { at: u32, count: u32 },
+}
+
+impl Edit {
+    /// Map an index on the edited axis to its new position, or `None` if the
+    /// index falls inside a deleted span.
+    fn map(&self, idx: u32) -> Option<u32> {
+        match *self {
+            Edit::Insert { at, count } => Some(if idx >= at { idx + count } else { idx }),
+            Edit::Delete { at, count } => {
+                if idx < at {
+                    Some(idx)
+                } else if idx < at + count {
+                    None
+                } else {
+                    Some(idx - count)
+                }
+            }
+        }
+    }
+}
 
 /// What a cell stores: a literal value or a formula (kept both as source text
 /// and as its parsed AST so we can re-display and re-evaluate without reparsing).
@@ -129,6 +162,54 @@ impl Sheet {
         (cols, rows)
     }
 
+    /// Insert `count` blank rows at row index `at` (zero-based), shifting cells
+    /// below down and fixing up same-sheet references in every formula.
+    pub fn insert_rows(&mut self, at: u32, count: u32) {
+        self.apply_structural(Axis::Row, Edit::Insert { at, count });
+    }
+
+    /// Delete `count` rows starting at row index `at`. Cells in the deleted band
+    /// are removed; references to them become `#REF!`; cells below shift up.
+    pub fn delete_rows(&mut self, at: u32, count: u32) {
+        self.apply_structural(Axis::Row, Edit::Delete { at, count });
+    }
+
+    /// Insert `count` blank columns at column index `at`.
+    pub fn insert_cols(&mut self, at: u32, count: u32) {
+        self.apply_structural(Axis::Col, Edit::Insert { at, count });
+    }
+
+    /// Delete `count` columns starting at column index `at`.
+    pub fn delete_cols(&mut self, at: u32, count: u32) {
+        self.apply_structural(Axis::Col, Edit::Delete { at, count });
+    }
+
+    /// Reposition every cell for a structural edit and rewrite formula
+    /// references, regenerating each affected formula's source text.
+    fn apply_structural(&mut self, axis: Axis, edit: Edit) {
+        let (Edit::Insert { count, .. } | Edit::Delete { count, .. }) = edit;
+        if count == 0 {
+            return;
+        }
+        let old = std::mem::take(&mut self.cells);
+        for (key, content) in old {
+            let Some(new_key) = reposition(key, axis, &edit) else {
+                continue; // cell sat in a deleted band
+            };
+            let new_content = match content {
+                CellContent::Formula { ast, .. } => {
+                    let ast = adjust_expr(&ast, axis, &edit);
+                    CellContent::Formula {
+                        src: formula::unparse(&ast),
+                        ast,
+                    }
+                }
+                literal => literal,
+            };
+            self.cells.insert(new_key, new_content);
+        }
+    }
+
     /// Evaluate every cell and return a grid of computed values keyed by
     /// `(col, row)`. Empty cells are omitted from the map.
     pub fn evaluate(&self) -> HashMap<(u32, u32), Value> {
@@ -141,6 +222,114 @@ impl Sheet {
             .get(&Self::key(r))
             .cloned()
             .unwrap_or(Value::Empty)
+    }
+}
+
+/// Map a stored cell's coordinate through a structural edit, or `None` if the
+/// cell sits in a deleted band.
+fn reposition(key: (u32, u32), axis: Axis, edit: &Edit) -> Option<(u32, u32)> {
+    let (col, row) = key;
+    match axis {
+        Axis::Row => Some((col, edit.map(row)?)),
+        Axis::Col => Some((edit.map(col)?, row)),
+    }
+}
+
+/// Adjust the index of a single reference on the edited axis. Returns `None`
+/// when the reference points into a deleted band (→ `#REF!`).
+fn adjust_cellref(r: CellRef, axis: Axis, edit: &Edit) -> Option<CellRef> {
+    match axis {
+        Axis::Row => Some(CellRef {
+            row: edit.map(r.row)?,
+            ..r
+        }),
+        Axis::Col => Some(CellRef {
+            col: edit.map(r.col)?,
+            ..r
+        }),
+    }
+}
+
+/// Index of a reference on the edited axis.
+fn axis_index(r: &CellRef, axis: Axis) -> u32 {
+    match axis {
+        Axis::Row => r.row,
+        Axis::Col => r.col,
+    }
+}
+
+fn with_axis_index(mut r: CellRef, axis: Axis, idx: u32) -> CellRef {
+    match axis {
+        Axis::Row => r.row = idx,
+        Axis::Col => r.col = idx,
+    }
+    r
+}
+
+/// Adjust a range through an edit. The whole range becomes `#REF!` only when it
+/// is entirely inside a deleted band; otherwise deleted endpoints clamp to the
+/// surviving boundary (the range shrinks), matching spreadsheet behavior.
+fn adjust_range(range: CellRange, axis: Axis, edit: &Edit) -> Option<CellRange> {
+    let start_idx = axis_index(&range.start, axis);
+    let end_idx = axis_index(&range.end, axis);
+
+    if let Edit::Delete { at, count } = *edit {
+        let start_deleted = start_idx >= at && start_idx < at + count;
+        let end_deleted = end_idx >= at && end_idx < at + count;
+        if start_deleted && end_deleted {
+            return None; // whole range gone
+        }
+        let new_start = if start_deleted {
+            at // collapses to the first surviving cell
+        } else {
+            edit.map(start_idx)?
+        };
+        let new_end = if end_deleted {
+            at.saturating_sub(1) // last surviving cell before the band
+        } else {
+            edit.map(end_idx)?
+        };
+        if new_start > new_end {
+            return None;
+        }
+        return Some(CellRange {
+            start: with_axis_index(range.start, axis, new_start),
+            end: with_axis_index(range.end, axis, new_end),
+        });
+    }
+
+    // Insert: both endpoints always survive.
+    Some(CellRange {
+        start: adjust_cellref(range.start, axis, edit)?,
+        end: adjust_cellref(range.end, axis, edit)?,
+    })
+}
+
+/// Rewrite every same-sheet reference in an expression for a structural edit.
+/// Sheet-qualified references target other sheets and are left untouched.
+fn adjust_expr(expr: &Expr, axis: Axis, edit: &Edit) -> Expr {
+    match expr {
+        Expr::Ref(r) => match adjust_cellref(*r, axis, edit) {
+            Some(nr) => Expr::Ref(nr),
+            None => Expr::RefError,
+        },
+        Expr::Range(range) => match adjust_range(*range, axis, edit) {
+            Some(nr) => Expr::Range(nr),
+            None => Expr::RefError,
+        },
+        Expr::Neg(inner) => Expr::Neg(Box::new(adjust_expr(inner, axis, edit))),
+        Expr::Percent(inner) => Expr::Percent(Box::new(adjust_expr(inner, axis, edit))),
+        Expr::Binary(op, a, b) => Expr::Binary(
+            *op,
+            Box::new(adjust_expr(a, axis, edit)),
+            Box::new(adjust_expr(b, axis, edit)),
+        ),
+        Expr::Func(name, args) => Expr::Func(
+            name.clone(),
+            args.iter().map(|a| adjust_expr(a, axis, edit)).collect(),
+        ),
+        // Literals, sheet-qualified refs, names, and existing #REF! pass through.
+        other => other.clone(),
     }
 }
 
@@ -207,5 +396,62 @@ mod tests {
         s.set_input(cell("A1"), "1").unwrap();
         s.set_input(cell("C5"), "2").unwrap();
         assert_eq!(s.dimensions(), (3, 5));
+    }
+
+    #[test]
+    fn insert_rows_shifts_cells_and_fixes_refs() {
+        let mut s = Sheet::new("Sheet1");
+        s.set_input(cell("A1"), "10").unwrap();
+        s.set_input(cell("A2"), "20").unwrap();
+        s.set_formula(cell("A3"), "=A1+A2").unwrap();
+
+        // Insert one row above row 2 (index 1): A2->A3, A3->A4.
+        s.insert_rows(1, 1);
+        assert_eq!(s.get(cell("A1")), Value::Number(10.0));
+        assert_eq!(s.raw_text(cell("A2")), ""); // new blank row
+        assert_eq!(s.get(cell("A3")), Value::Number(20.0));
+        // The formula moved to A4 and its refs shifted to A1 and A3.
+        assert_eq!(s.raw_text(cell("A4")), "=A1+A3");
+        assert_eq!(s.get(cell("A4")), Value::Number(30.0));
+    }
+
+    #[test]
+    fn delete_rows_breaks_refs_to_deleted_cells() {
+        let mut s = Sheet::new("Sheet1");
+        s.set_input(cell("A1"), "5").unwrap();
+        s.set_input(cell("A2"), "6").unwrap();
+        s.set_formula(cell("B1"), "=A1+A2").unwrap();
+        s.set_formula(cell("B2"), "=A2*10").unwrap();
+
+        // Delete row 1 (index 0): A1 and B1 are removed; A2->A1, B2->B1.
+        s.delete_rows(0, 1);
+        assert_eq!(s.get(cell("A1")), Value::Number(6.0));
+        // B2's formula moved to B1 and its A2 ref shifted up to A1.
+        assert_eq!(s.raw_text(cell("B1")), "=A1*10");
+        assert_eq!(s.get(cell("B1")), Value::Number(60.0));
+    }
+
+    #[test]
+    fn deleting_a_referenced_cell_yields_ref_error() {
+        let mut s = Sheet::new("Sheet1");
+        s.set_input(cell("A1"), "1").unwrap();
+        s.set_formula(cell("C1"), "=A1+1").unwrap();
+        // Delete column A (index 0): A1 gone, C1->B1, ref A1 is broken.
+        s.delete_cols(0, 1);
+        assert_eq!(s.raw_text(cell("B1")), "=#REF!+1");
+        assert_eq!(s.get(cell("B1")), Value::Error(CellError::Ref));
+    }
+
+    #[test]
+    fn insert_columns_expands_a_spanning_range() {
+        let mut s = Sheet::new("Sheet1");
+        s.set_input(cell("A1"), "1").unwrap();
+        s.set_input(cell("B1"), "2").unwrap();
+        s.set_input(cell("C1"), "3").unwrap();
+        s.set_formula(cell("E1"), "=SUM(A1:C1)").unwrap();
+        // Insert a column at index 1 (between A and B): range A1:C1 -> A1:D1.
+        s.insert_cols(1, 1);
+        assert_eq!(s.raw_text(cell("F1")), "=SUM(A1:D1)");
+        assert_eq!(s.get(cell("F1")), Value::Number(6.0));
     }
 }

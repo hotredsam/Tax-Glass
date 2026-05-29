@@ -127,7 +127,7 @@ fn walk(expr: &Expr, out: &mut HashSet<CellKey>) {
                 walk(a, out);
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Name(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Name(_) | Expr::RefError => {}
     }
 }
 

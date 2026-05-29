@@ -179,6 +179,7 @@ impl<'a> Evaluator<'a> {
                 Some(_) => Value::Error(CellError::Value),
                 None => Value::Error(CellError::Name),
             },
+            Expr::RefError => Value::Error(CellError::Ref),
             Expr::Neg(inner) => match self.eval(inner).as_number() {
                 Ok(n) => Value::Number(-n),
                 Err(e) => Value::Error(e),
