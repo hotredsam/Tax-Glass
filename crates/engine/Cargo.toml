@@ -10,3 +10,6 @@ description = "GlassSheet spreadsheet engine: cells, A1 addressing, and a formul
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+proptest = "1"
