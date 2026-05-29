@@ -590,6 +590,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "glasssheet-perf-lab"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "glasssheet-engine",
+]
+
+[[package]]
 name = "glasssheet-tui"
 version = "0.1.0"
 dependencies = [

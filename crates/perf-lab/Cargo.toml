@@ -1,0 +1,16 @@
+[package]
+name = "glasssheet-perf-lab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Autotuning harness: benchmark + verify candidate math kernels (incl. inline asm) and emit a perf report."
+
+[[bin]]
+name = "perf-lab"
+path = "src/main.rs"
+
+[dependencies]
+glasssheet-engine.workspace = true
+clap.workspace = true

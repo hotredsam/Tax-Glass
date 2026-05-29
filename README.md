@@ -171,7 +171,29 @@ $ cargo build
 $ cargo test
 $ cargo clippy --all-targets
 $ cargo fmt
+$ cargo bench -p glasssheet-engine          # criterion benchmarks
 ```
+
+## Performance & autotuning
+
+The numeric reductions behind `SUM`/`AVERAGE`/… live in `crate::kernels` as a
+small, allocation-free, autovectorizing API, and aggregates stream their inputs
+into reused buffers (no per-call allocation).
+
+`crates/perf-lab` is an autotuning harness: it benchmarks candidate kernels —
+scalar, chunked, AVX intrinsics, and a **literal inline-assembly** path on
+x86_64 — **verifying** each against the scalar reference over an edge-case corpus
+(NaN/∞/−0/denormals/empty) before timing them, and writes `PERF_REPORT.md`.
+
+```console
+$ cargo run --release -p glasssheet-perf-lab -- --iterations 10000
+```
+
+`scripts/perf_autotune.sh` (driven by the `/perf-autotune` command, optionally on
+a `/loop`) runs the search, enforces `fmt` + `clippy -D warnings` +
+`cargo test --all`, and pushes the refreshed report — only when every gate is
+green. The shipped engine kernels stay pure safe Rust; the asm candidates are
+measured in the harness, not in the build path.
 
 ## Roadmap
 
