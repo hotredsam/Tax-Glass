@@ -81,13 +81,42 @@ $ cargo run -p glasssheet-cli -- budget.csv --output budget.xlsx # csv  -> xlsx
 
 - **Operators:** `+ - * / ^`, comparison (`= <> < > <= >=`), text concat (`&`),
   unary minus, and postfix `%`. Exponentiation is right-associative.
-- **References:** `A1`, absolute `$A$1`, and ranges `A1:C4`.
-- **Functions:** `SUM`, `AVERAGE`, `MIN`, `MAX`, `COUNT`, `COUNTA`, `PRODUCT`,
-  `IF`, `AND`, `OR`, `NOT`, `ABS`, `SQRT`, `POWER`, `MOD`, `INT`, `TRUNC`,
-  `SIGN`, `ROUND`, `ROUNDUP`, `ROUNDDOWN`, `CONCAT`/`CONCATENATE`, `LEN`,
-  `UPPER`, `LOWER`, `TRIM`.
+- **References:** `A1`, absolute `$A$1`, ranges `A1:C4`, whole column/row
+  (`A:A`, `1:1`), cross-sheet (`Sheet2!A1`), named ranges, and R1C1 style.
+- **Arrays:** array literals `{1,2;3,4}` and dynamic spilling (with `#SPILL!`).
+- **Functions** (~80), including:
+  - Aggregation: `SUM`, `AVERAGE`, `MIN`, `MAX`, `COUNT(A)`, `PRODUCT`,
+    `SUMIF(S)`, `COUNTIF(S)`, `AVERAGEIF(S)`, `SUMPRODUCT`, `SUBTOTAL`, `AGGREGATE`.
+  - Math: `ABS`, `SQRT`, `POWER`, `MOD`, `INT`, `TRUNC`, `SIGN`, `ROUND(UP|DOWN)`,
+    `MROUND`, `CEILING(.MATH)`, `FLOOR(.MATH)`, `EVEN`, `ODD`, `QUOTIENT`,
+    `GCD`, `LCM`, `FACT`, `FACTDOUBLE`, `COMBIN(A)`, `PERMUT(ATIONA)`.
+  - Trig/log: `PI`, `SIN…ATAN2`, `SINH…ATANH`, `DEGREES`, `RADIANS`, `LN`,
+    `LOG`, `LOG10`, `EXP`, `SQRTPI`.
+  - Stats/random: `MEDIAN`, `MODE`, `GEOMEAN`, `HARMEAN`, `TRIMMEAN`, `RAND`,
+    `RANDBETWEEN`.
+  - Numerals: `ROMAN`, `ARABIC`, `BASE`, `DECIMAL`.
+  - Logical/text: `IF`, `AND`, `OR`, `NOT`, `CONCAT`/`CONCATENATE`, `LEN`,
+    `UPPER`, `LOWER`, `TRIM`.
+  - **GlassSheet extensions** (not in Excel): `COMPARE(a,b)` → −1/0/1,
+    `SIMILARITY(t1,t2)` → 0–1 fuzzy match, and `AI(prompt)` (see below).
 - **Error values** propagate through dependents: `#DIV/0!`, `#VALUE!`, `#REF!`,
-  `#NAME?`, `#NUM!`, `#N/A`, and `#CIRC!` for circular references.
+  `#NAME?`, `#NUM!`, `#N/A`, `#SPILL!`, and `#CIRC!` for circular references.
+
+## Beyond Excel
+
+- **Incremental recalc** (`RecalcEngine`): editing one cell in a 10k-cell sheet
+  recomputes in **~1.6 µs** (see `cargo bench`). Iterative mode handles
+  intentional circular references.
+- **Goal Seek:** `goal_seek` solves for the input that drives a formula to a
+  target.
+- **Rich cells:** styles, number formats, dates, conditional formatting, data
+  validation, frozen panes, sheet protection, merged cells, undo/redo.
+- **Threaded notes:** comments with replies, resolve state, tags, and
+  timestamps — well past Excel's plain notes.
+- **Themes:** Light / Dark / Glass palettes on the workbook.
+- **AI functions:** `AI("…")` reads a refreshable, TTL-aware cache; a real
+  model (hosted **or local**) plugs in as an `AiProvider` while the engine
+  stays pure and offline. Stale results re-fetch on a background cadence.
 
 ## Using the engine as a library
 
