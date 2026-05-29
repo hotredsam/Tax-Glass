@@ -34,4 +34,4 @@ pub use formula::{BinOp, Expr};
 pub use recalc::RecalcEngine;
 pub use sheet::{CellContent, Sheet};
 pub use value::{CellError, Value};
-pub use workbook::Workbook;
+pub use workbook::{DefinedName, Workbook};

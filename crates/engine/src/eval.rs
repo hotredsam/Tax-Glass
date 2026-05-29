@@ -20,6 +20,10 @@ pub trait Cells {
     fn sheet_index(&self, name: &str) -> Option<usize>;
     /// The content stored at a coordinate, if any.
     fn content(&self, sheet: usize, col: u32, row: u32) -> Option<&CellContent>;
+    /// Resolve a defined name to a `(sheet index, range)`. Defaults to none.
+    fn resolve_name(&self, _name: &str) -> Option<(usize, crate::address::CellRange)> {
+        None
+    }
 }
 
 impl Cells for Sheet {
@@ -47,6 +51,10 @@ impl Cells for Workbook {
 
     fn content(&self, sheet: usize, col: u32, row: u32) -> Option<&CellContent> {
         self.sheet_at(sheet).and_then(|s| s.content(col, row))
+    }
+
+    fn resolve_name(&self, name: &str) -> Option<(usize, crate::address::CellRange)> {
+        self.resolve_defined_name(name)
     }
 }
 
@@ -162,7 +170,15 @@ impl<'a> Evaluator<'a> {
             },
             // A bare range used as a scalar has no implicit intersection here.
             Expr::Range(_) | Expr::SheetRange(_, _) => Value::Error(CellError::Value),
-            Expr::Name(_) => Value::Error(CellError::Name),
+            Expr::Name(name) => match self.cells.resolve_name(name) {
+                // A 1×1 named range resolves to that cell's value; a larger one
+                // is a range and has no scalar meaning here.
+                Some((idx, range)) if range.len() == 1 => {
+                    self.value_at(idx, range.start.col, range.start.row)
+                }
+                Some(_) => Value::Error(CellError::Value),
+                None => Value::Error(CellError::Name),
+            },
             Expr::Neg(inner) => match self.eval(inner).as_number() {
                 Ok(n) => Value::Number(-n),
                 Err(e) => Value::Error(e),
@@ -252,6 +268,14 @@ impl<'a> Evaluator<'a> {
                     .map(|c| self.value_at(idx, c.col, c.row))
                     .collect(),
                 None => vec![Value::Error(CellError::Ref)],
+            },
+            // A named range expands to its target cells when used as an argument.
+            Expr::Name(name) => match self.cells.resolve_name(name) {
+                Some((idx, range)) => range
+                    .cells()
+                    .map(|c| self.value_at(idx, c.col, c.row))
+                    .collect(),
+                None => vec![Value::Error(CellError::Name)],
             },
             other => vec![self.eval(other)],
         }

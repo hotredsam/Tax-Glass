@@ -1,20 +1,31 @@
-//! A workbook: an ordered collection of named worksheets.
+//! A workbook: an ordered collection of named worksheets, plus workbook-scoped
+//! defined names (named ranges).
 //!
 //! Sheet names are unique case-insensitively (as in Excel) and the insertion
-//! order is preserved so tab order is stable. Cross-sheet formula references
-//! are not resolved yet — each sheet still evaluates independently — but this
-//! type is the container the front-ends and the native file format build on.
+//! order is preserved so tab order is stable.
 
+use crate::address::{CellRange, CellRef};
 use crate::error::{EngineError, Result};
 use crate::sheet::Sheet;
 use crate::value::Value;
 use std::collections::HashMap;
 
-/// An ordered set of worksheets with a tracked active sheet.
+/// A defined name (named range): a label that resolves to a range on a sheet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DefinedName {
+    /// The target sheet's name (resolved to an index at evaluation time, so the
+    /// binding survives sheet reordering).
+    pub sheet: String,
+    /// The target range (a single cell is a 1×1 range).
+    pub range: CellRange,
+}
+
+/// An ordered set of worksheets with a tracked active sheet and defined names.
 #[derive(Debug, Clone)]
 pub struct Workbook {
     sheets: Vec<Sheet>,
     active: usize,
+    names: HashMap<String, DefinedName>,
 }
 
 impl Default for Workbook {
@@ -23,6 +34,7 @@ impl Default for Workbook {
         Workbook {
             sheets: vec![Sheet::new("Sheet1")],
             active: 0,
+            names: HashMap::new(),
         }
     }
 }
@@ -39,6 +51,7 @@ impl Workbook {
         Workbook {
             sheets: Vec::new(),
             active: 0,
+            names: HashMap::new(),
         }
     }
 
@@ -165,6 +178,66 @@ impl Workbook {
         Ok(())
     }
 
+    /// Define (or replace) a named range pointing at a range on a sheet.
+    ///
+    /// The name must be non-empty and must not look like a cell reference
+    /// (Excel forbids names such as `A1`). The target sheet must exist.
+    pub fn define_name(
+        &mut self,
+        name: impl Into<String>,
+        sheet: &str,
+        range: CellRange,
+    ) -> Result<()> {
+        let name = name.into();
+        let key = normalize_name(&name)?;
+        let canonical = self
+            .index_of(sheet)
+            .and_then(|i| self.sheets.get(i))
+            .map(|s| s.name.clone())
+            .ok_or_else(|| EngineError::BadReference(format!("no sheet {sheet:?}")))?;
+        self.names.insert(
+            key,
+            DefinedName {
+                sheet: canonical,
+                range,
+            },
+        );
+        Ok(())
+    }
+
+    /// Convenience: define a name from an A1 range string like `"A1:B3"`.
+    pub fn define_name_str(
+        &mut self,
+        name: impl Into<String>,
+        sheet: &str,
+        range: &str,
+    ) -> Result<()> {
+        let range = CellRange::parse(range)?;
+        self.define_name(name, sheet, range)
+    }
+
+    /// Look up a defined name (case-insensitive).
+    pub fn defined_name(&self, name: &str) -> Option<&DefinedName> {
+        self.names.get(&name.to_ascii_uppercase())
+    }
+
+    /// Remove a defined name, returning it if present.
+    pub fn remove_name(&mut self, name: &str) -> Option<DefinedName> {
+        self.names.remove(&name.to_ascii_uppercase())
+    }
+
+    /// All defined names as `(name, target)` pairs.
+    pub fn names(&self) -> impl Iterator<Item = (&str, &DefinedName)> {
+        self.names.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Resolve a name to a `(sheet index, range)` for the evaluator.
+    pub(crate) fn resolve_defined_name(&self, name: &str) -> Option<(usize, CellRange)> {
+        let dn = self.names.get(&name.to_ascii_uppercase())?;
+        let idx = self.index_of(&dn.sheet)?;
+        Some((idx, dn.range))
+    }
+
     /// Evaluate every sheet, resolving cross-sheet references, and return each
     /// sheet's computed grid keyed by sheet name.
     pub fn evaluate(&self) -> HashMap<String, HashMap<(u32, u32), Value>> {
@@ -184,6 +257,33 @@ impl Workbook {
         }
         Ok(())
     }
+}
+
+/// Validate and normalize a defined-name key. Rejects empty names and names
+/// that look like cell references.
+fn normalize_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(EngineError::BadReference("empty name".into()));
+    }
+    if CellRef::parse(trimmed).is_ok() {
+        return Err(EngineError::BadReference(format!(
+            "name {trimmed:?} looks like a cell reference"
+        )));
+    }
+    let valid = trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+    let starts_ok = trimmed
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    if !valid || !starts_ok {
+        return Err(EngineError::BadReference(format!(
+            "invalid name {trimmed:?}"
+        )));
+    }
+    Ok(trimmed.to_ascii_uppercase())
 }
 
 #[cfg(test)]
@@ -246,6 +346,64 @@ mod tests {
         }
         wb.move_sheet(0, 2).unwrap();
         assert_eq!(wb.sheet_names(), ["B", "C", "A"]);
+    }
+
+    #[test]
+    fn defined_names_resolve_in_formulas() {
+        let mut wb = Workbook::empty();
+        wb.add_sheet("Data").unwrap();
+        {
+            let d = wb.sheet_mut("Data").unwrap();
+            d.set_input(CellRef::parse("A1").unwrap(), "10").unwrap();
+            d.set_input(CellRef::parse("A2").unwrap(), "20").unwrap();
+            d.set_input(CellRef::parse("A3").unwrap(), "30").unwrap();
+        }
+        wb.define_name_str("Sales", "Data", "A1:A3").unwrap();
+        wb.define_name_str("Tax_Rate", "Data", "A1").unwrap();
+
+        wb.add_sheet("Calc").unwrap();
+        wb.sheet_mut("Calc")
+            .unwrap()
+            .set_formula(CellRef::parse("B1").unwrap(), "=SUM(Sales) + Tax_Rate")
+            .unwrap();
+
+        let all = wb.evaluate();
+        // SUM(A1:A3)=60, plus the 1x1 name Tax_Rate=10 → 70.
+        assert_eq!(all["Calc"][&(1, 0)], Value::Number(70.0));
+    }
+
+    #[test]
+    fn unknown_name_is_name_error() {
+        let mut wb = Workbook::new();
+        wb.sheet_at_mut(0)
+            .unwrap()
+            .set_formula(CellRef::parse("A1").unwrap(), "=Mystery")
+            .unwrap();
+        let all = wb.evaluate();
+        assert_eq!(all["Sheet1"][&(0, 0)], Value::Error(crate::CellError::Name));
+    }
+
+    #[test]
+    fn invalid_names_are_rejected() {
+        let mut wb = Workbook::new();
+        assert!(
+            wb.define_name_str("A1", "Sheet1", "B1").is_err(),
+            "looks like a ref"
+        );
+        assert!(wb.define_name_str("", "Sheet1", "B1").is_err(), "empty");
+        assert!(
+            wb.define_name_str("1total", "Sheet1", "B1").is_err(),
+            "bad start"
+        );
+        assert!(
+            wb.define_name_str("Total", "Ghost", "B1").is_err(),
+            "missing sheet"
+        );
+        assert!(wb.define_name_str("Total", "Sheet1", "B1").is_ok());
+        assert!(
+            wb.defined_name("total").is_some(),
+            "lookup case-insensitive"
+        );
     }
 
     #[test]
