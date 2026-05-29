@@ -17,6 +17,7 @@
 //! ```
 
 pub mod address;
+pub mod condformat;
 pub mod datetime;
 pub mod deps;
 pub mod error;
@@ -30,6 +31,7 @@ pub mod value;
 pub mod workbook;
 
 pub use address::{CellRange, CellRef};
+pub use condformat::{Condition, Rule};
 pub use deps::{CellKey, DependencyGraph};
 pub use error::{EngineError, Result};
 pub use eval::{evaluate_sheet_iterative, evaluate_workbook, Cells};

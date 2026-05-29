@@ -2,6 +2,7 @@
 //! value or a parsed formula.
 
 use crate::address::{CellRange, CellRef};
+use crate::condformat::Rule;
 use crate::error::Result;
 use crate::eval::evaluate_sheet;
 use crate::formula::{self, Expr};
@@ -57,6 +58,7 @@ pub struct Sheet {
     pub name: String,
     cells: HashMap<(u32, u32), CellContent>,
     styles: HashMap<(u32, u32), CellStyle>,
+    cond_rules: Vec<Rule>,
 }
 
 impl Sheet {
@@ -66,6 +68,7 @@ impl Sheet {
             name: name.into(),
             cells: HashMap::new(),
             styles: HashMap::new(),
+            cond_rules: Vec::new(),
         }
     }
 
@@ -146,6 +149,23 @@ impl Sheet {
     /// tweaking one attribute.
     pub fn style_mut(&mut self, r: CellRef) -> &mut CellStyle {
         self.styles.entry((r.col, r.row)).or_default()
+    }
+
+    /// Add a conditional-formatting rule (lower index = higher priority).
+    pub fn add_conditional_rule(&mut self, rule: Rule) {
+        self.cond_rules.push(rule);
+    }
+
+    /// The conditional-formatting rules, in priority order.
+    pub fn conditional_rules(&self) -> &[Rule] {
+        &self.cond_rules
+    }
+
+    /// Evaluate the sheet and resolve which conditional style (if any) applies
+    /// to each cell. The first matching rule wins.
+    pub fn conditional_styles(&self) -> HashMap<(u32, u32), CellStyle> {
+        let computed = self.evaluate();
+        crate::condformat::effective_styles(&self.cond_rules, &computed)
     }
 
     /// The displayed text of a cell: its computed value rendered through the
@@ -584,6 +604,32 @@ mod tests {
         // A cell without a number format displays its general value.
         s.set_input(cell("A2"), "5").unwrap();
         assert_eq!(s.display(cell("A2")), "5");
+    }
+
+    #[test]
+    fn conditional_formatting_highlights_matching_cells() {
+        use crate::condformat::{Condition, Rule};
+        use crate::style::{CellStyle, Color};
+
+        let mut s = Sheet::new("Sheet1");
+        s.set_input(cell("A1"), "5").unwrap();
+        s.set_input(cell("A2"), "50").unwrap();
+        s.set_formula(cell("A3"), "=A2*2").unwrap(); // 100
+
+        let highlight = CellStyle {
+            fill: Some(Color::rgb(255, 0, 0)),
+            ..Default::default()
+        };
+        s.add_conditional_rule(Rule::new(
+            CellRange::parse("A1:A3").unwrap(),
+            Condition::GreaterThan(40.0),
+            highlight.clone(),
+        ));
+
+        let styles = s.conditional_styles();
+        assert!(!styles.contains_key(&(0, 0)), "5 not > 40");
+        assert_eq!(styles.get(&(0, 1)), Some(&highlight)); // 50
+        assert_eq!(styles.get(&(0, 2)), Some(&highlight)); // 100 (from formula)
     }
 
     #[test]
