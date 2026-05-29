@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/engine",
+    "crates/io",
     "crates/cli",
 ]
 
@@ -18,4 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 csv = "1"
+calamine = "0.26"
+rust_xlsxwriter = "0.79"
 glasssheet-engine = { path = "crates/engine" }
+glasssheet-io = { path = "crates/io" }

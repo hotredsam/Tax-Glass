@@ -24,6 +24,7 @@ glasssheet/
         formula.rs      #   tokenizer, AST, recursive-descent parser
         eval.rs         #   memoized evaluator + built-in functions
         sheet.rs        #   the worksheet (sparse cell grid)
+    io/                 # glasssheet-io — file import/export (csv, xlsx, ods, …)
     cli/                # glasssheet-cli — command-line front-end (binary)
   examples/
     budget.csv          # sample spreadsheet with formulas
@@ -52,6 +53,28 @@ Other modes:
 $ cargo run -p glasssheet-cli -- examples/budget.csv --format csv   # computed CSV
 $ cargo run -p glasssheet-cli -- examples/budget.csv --cell D5      # one cell
 $ cargo run -p glasssheet-cli -- examples/budget.csv --cell D5 --raw  # show =SUM(...)
+```
+
+### File formats
+
+GlassSheet opens spreadsheets in any of these formats and detects the type from
+the file:
+
+| Format | Read | Write |
+|--------|:----:|:-----:|
+| `.csv` / `.tsv` | ✅ | ✅ |
+| `.xlsx` / `.xlsm` | ✅ | ✅ |
+| `.xlsb` | ✅ | — |
+| `.xls` | ✅ | — |
+| `.ods` | ✅ | — |
+
+Reading preserves stored formulas where the source file provides them; XLSX
+export writes a real, editable workbook with formulas kept live. Convert between
+formats with `--output`:
+
+```console
+$ cargo run -p glasssheet-cli -- data.xlsx --output data.csv     # xlsx -> csv
+$ cargo run -p glasssheet-cli -- budget.csv --output budget.xlsx # csv  -> xlsx
 ```
 
 ## Formula support
@@ -89,10 +112,11 @@ $ cargo fmt
 
 ## Roadmap
 
-The CLI is the first front-end. Planned, building on the same engine:
+Building on the same engine:
 
-- Native `.xlsx` / `.ods` import & export.
+- ✅ Native `.xlsx` / `.xls` / `.xlsb` / `.ods` / `.csv` import; `.xlsx` / `.csv` export.
 - Native desktop GUI (grid editor) with glassmorphism theming.
+- Multi-sheet workbooks and cross-sheet references.
 - A web build (WASM) and a mobile app.
 - A native GlassSheet document format.
 

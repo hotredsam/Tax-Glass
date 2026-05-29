@@ -1,24 +1,32 @@
 //! `glasssheet` — command-line front-end for the GlassSheet engine.
 //!
-//! Loads a CSV where any cell may contain a formula (a leading `=`), evaluates
-//! it, and prints the computed grid as an aligned table or back out as CSV.
+//! Opens a spreadsheet in any supported format (`.csv`, `.tsv`, `.xlsx`,
+//! `.xlsm`, `.xlsb`, `.xls`, `.ods`), evaluates its formulas, and either prints
+//! the computed grid (table or CSV) or writes it back out via `--output`.
 
 use clap::{Parser, ValueEnum};
 use glasssheet_engine::{CellRef, Sheet, Value};
+use glasssheet_io::{export_path, import_path};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "glasssheet",
-    about = "Evaluate a CSV spreadsheet with formulas (e.g. =SUM(A1:A3))",
+    about = "Open, evaluate, and convert spreadsheets (.csv/.xlsx/.xls/.xlsb/.ods)",
     version
 )]
 struct Cli {
-    /// Input CSV file. Cells starting with `=` are treated as formulas.
+    /// Input file. Any supported spreadsheet format; CSV cells starting with
+    /// `=` are treated as formulas.
     input: PathBuf,
 
-    /// Output format.
+    /// Write the evaluated sheet to a file instead of stdout. Format is chosen
+    /// by extension: `.csv`, `.tsv`, or `.xlsx` (formulas stay live in xlsx).
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Output format for stdout.
     #[arg(short, long, value_enum, default_value_t = Format::Table)]
     format: Format,
 
@@ -49,7 +57,14 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let sheet = load_csv(&cli.input)?;
+    let sheet = import_path(&cli.input)?;
+
+    // Writing to a file takes precedence over stdout rendering.
+    if let Some(out) = &cli.output {
+        export_path(&sheet, out)?;
+        eprintln!("wrote {}", out.display());
+        return Ok(());
+    }
 
     if let Some(addr) = &cli.cell {
         let r = CellRef::parse(addr)?;
@@ -68,27 +83,6 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Format::Table => print_table(&grid),
     }
     Ok(())
-}
-
-/// Read a CSV into a sheet, inferring cell types via `set_input`.
-fn load_csv(path: &PathBuf) -> Result<Sheet, Box<dyn std::error::Error>> {
-    let mut reader = csv::ReaderBuilder::new()
-        .has_headers(false)
-        .flexible(true)
-        .from_path(path)?;
-
-    let mut sheet = Sheet::new("Sheet1");
-    for (row_idx, record) in reader.records().enumerate() {
-        let record = record?;
-        for (col_idx, field) in record.iter().enumerate() {
-            if field.is_empty() {
-                continue;
-            }
-            let r = CellRef::new(col_idx as u32, row_idx as u32);
-            sheet.set_input(r, field)?;
-        }
-    }
-    Ok(sheet)
 }
 
 /// Materialize the sheet into a dense `rows × cols` grid of strings.
