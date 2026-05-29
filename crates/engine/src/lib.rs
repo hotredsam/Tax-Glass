@@ -17,6 +17,7 @@
 //! ```
 
 pub mod address;
+pub mod deps;
 pub mod error;
 pub mod eval;
 pub mod formula;
@@ -25,6 +26,7 @@ pub mod value;
 pub mod workbook;
 
 pub use address::{CellRange, CellRef};
+pub use deps::{CellKey, DependencyGraph};
 pub use error::{EngineError, Result};
 pub use eval::{evaluate_workbook, Cells};
 pub use formula::{BinOp, Expr};
