@@ -17,6 +17,7 @@
 //! ```
 
 pub mod address;
+pub mod ai;
 pub mod condformat;
 pub mod datetime;
 pub mod deps;
@@ -35,6 +36,7 @@ pub mod view;
 pub mod workbook;
 
 pub use address::{CellRange, CellRef};
+pub use ai::{AiCache, AiProvider, EchoProvider, FnProvider};
 pub use condformat::{Condition, Rule};
 pub use deps::{CellKey, DependencyGraph};
 pub use error::{EngineError, Result};

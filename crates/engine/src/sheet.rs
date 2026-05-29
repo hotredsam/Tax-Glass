@@ -95,6 +95,8 @@ pub struct Sheet {
     unlocked: HashSet<(u32, u32)>,
     /// Merged regions; the top-left cell is the anchor and holds the value.
     merges: Vec<CellRange>,
+    /// Cache of AI/model-call results (see [`crate::ai`]).
+    ai_cache: crate::ai::AiCache,
 }
 
 impl Sheet {
@@ -111,7 +113,36 @@ impl Sheet {
             protected: false,
             unlocked: HashSet::new(),
             merges: Vec::new(),
+            ai_cache: crate::ai::AiCache::default(),
         }
+    }
+
+    /// The AI result cache backing `AI(...)` formulas.
+    pub fn ai_cache(&self) -> &crate::ai::AiCache {
+        &self.ai_cache
+    }
+
+    /// Mutable access to the AI result cache.
+    pub fn ai_cache_mut(&mut self) -> &mut crate::ai::AiCache {
+        &mut self.ai_cache
+    }
+
+    /// Literal prompts of all `AI(...)` calls on the sheet.
+    pub fn ai_prompts(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (_, content) in self.iter() {
+            if let CellContent::Formula { ast, .. } = content {
+                crate::ai::collect_prompts(ast, &mut out);
+            }
+        }
+        out
+    }
+
+    /// Refresh stale `AI(...)` results through `provider`, returning how many
+    /// were fetched. After this, evaluation reflects the new values.
+    pub fn refresh_ai(&mut self, provider: &dyn crate::ai::AiProvider) -> usize {
+        let prompts = self.ai_prompts();
+        crate::ai::refresh(&mut self.ai_cache, &prompts, provider)
     }
 
     fn key(r: CellRef) -> (u32, u32) {

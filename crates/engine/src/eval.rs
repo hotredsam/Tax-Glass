@@ -61,6 +61,10 @@ impl Cells for Sheet {
             (0, 0)
         }
     }
+
+    fn ai_lookup(&self, prompt: &str) -> Option<Value> {
+        self.ai_cache().get(prompt)
+    }
 }
 
 impl Cells for Workbook {
@@ -1894,10 +1898,15 @@ mod tests {
     }
 
     #[test]
-    fn ai_function_pending_without_cache() {
-        // With no AI cache wired in (a bare Sheet), AI(...) is pending → #N/A.
-        let s = sheet_with(&[("A1", "=AI(\"summarize sales\")")]);
-        assert_eq!(val(&s, "A1"), Value::Error(CellError::NA));
+    fn ai_function_pending_then_refreshed() {
+        // Before a refresh, AI(...) is pending → #N/A.
+        let mut s = Sheet::new("Sheet1");
+        s.set_formula(r("A1"), "=AI(\"summarize sales\")").unwrap();
+        assert_eq!(s.get(r("A1")), Value::Error(CellError::NA));
+
+        // After refreshing through a provider, the cached result is returned.
+        s.refresh_ai(&crate::ai::EchoProvider);
+        assert_eq!(s.get(r("A1")), Value::Text("AI[summarize sales]".into()));
     }
 
     #[test]
