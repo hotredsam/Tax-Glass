@@ -210,6 +210,37 @@ impl Sheet {
         }
     }
 
+    /// Copy a cell to another location, translating relative references like a
+    /// spreadsheet copy/paste. Literals are copied verbatim; formulas have their
+    /// relative refs shifted by `to - from` (absolute `$` parts stay fixed).
+    /// Copying an empty source clears the destination.
+    pub fn copy_cell(&mut self, from: CellRef, to: CellRef) {
+        let dcol = to.col as i64 - from.col as i64;
+        let drow = to.row as i64 - from.row as i64;
+        match self.content(from.col, from.row).cloned() {
+            None => self.set_value(to, Value::Empty),
+            Some(CellContent::Literal(v)) => self.set_value(to, v),
+            Some(CellContent::Formula { ast, .. }) => {
+                let ast = formula::translate(&ast, dcol, drow);
+                self.cells.insert(
+                    (to.col, to.row),
+                    CellContent::Formula {
+                        src: formula::unparse(&ast),
+                        ast,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Fill `source` into every cell of `target`, translating references per
+    /// destination — the common drag-to-fill / paste-to-range operation.
+    pub fn fill(&mut self, source: CellRef, target: CellRange) {
+        for dest in target.cells() {
+            self.copy_cell(source, dest);
+        }
+    }
+
     /// Evaluate every cell and return a grid of computed values keyed by
     /// `(col, row)`. Empty cells are omitted from the map.
     pub fn evaluate(&self) -> HashMap<(u32, u32), Value> {
@@ -440,6 +471,59 @@ mod tests {
         s.delete_cols(0, 1);
         assert_eq!(s.raw_text(cell("B1")), "=#REF!+1");
         assert_eq!(s.get(cell("B1")), Value::Error(CellError::Ref));
+    }
+
+    #[test]
+    fn copy_cell_translates_relative_refs() {
+        let mut s = Sheet::new("Sheet1");
+        s.set_input(cell("A1"), "1").unwrap();
+        s.set_input(cell("A2"), "2").unwrap();
+        s.set_input(cell("B1"), "10").unwrap();
+        s.set_input(cell("B2"), "20").unwrap();
+        s.set_formula(cell("A3"), "=A1+A2").unwrap();
+
+        // Copy A3 -> B3: refs shift one column right.
+        s.copy_cell(cell("A3"), cell("B3"));
+        assert_eq!(s.raw_text(cell("B3")), "=B1+B2");
+        assert_eq!(s.get(cell("B3")), Value::Number(30.0));
+        // Original is unchanged.
+        assert_eq!(s.raw_text(cell("A3")), "=A1+A2");
+    }
+
+    #[test]
+    fn copy_keeps_absolute_refs_fixed() {
+        let mut s = Sheet::new("Sheet1");
+        s.set_input(cell("A1"), "100").unwrap();
+        s.set_formula(cell("B1"), "=$A$1*C1").unwrap();
+        // Copy B1 -> B2: $A$1 stays, C1 -> C2.
+        s.copy_cell(cell("B1"), cell("B2"));
+        assert_eq!(s.raw_text(cell("B2")), "=$A$1*C2");
+    }
+
+    #[test]
+    fn copy_off_the_grid_becomes_ref_error() {
+        let mut s = Sheet::new("Sheet1");
+        s.set_formula(cell("B1"), "=A1").unwrap();
+        // Copy B1 -> A1: relative ref would point to column -1.
+        s.copy_cell(cell("B1"), cell("A1"));
+        assert_eq!(s.raw_text(cell("A1")), "=#REF!");
+        assert_eq!(s.get(cell("A1")), Value::Error(CellError::Ref));
+    }
+
+    #[test]
+    fn fill_propagates_a_formula_across_a_range() {
+        let mut s = Sheet::new("Sheet1");
+        for (i, v) in ["1", "2", "3"].iter().enumerate() {
+            s.set_input(CellRef::new(0, i as u32), v).unwrap(); // A1:A3
+            s.set_input(CellRef::new(1, i as u32), &((i + 1) * 10).to_string())
+                .unwrap(); // B1:B3
+        }
+        s.set_formula(cell("C1"), "=A1*B1").unwrap();
+        s.fill(cell("C1"), CellRange::parse("C1:C3").unwrap());
+        assert_eq!(s.get(cell("C1")), Value::Number(10.0));
+        assert_eq!(s.get(cell("C2")), Value::Number(40.0));
+        assert_eq!(s.get(cell("C3")), Value::Number(90.0));
+        assert_eq!(s.raw_text(cell("C3")), "=A3*B3");
     }
 
     #[test]

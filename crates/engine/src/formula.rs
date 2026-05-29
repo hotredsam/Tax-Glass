@@ -154,6 +154,70 @@ fn quote_sheet(name: &str) -> String {
     }
 }
 
+/// Translate an expression's relative references by `(dcol, drow)`, as when a
+/// formula is copied/filled from one cell to another. Absolute (`$`) parts stay
+/// fixed. A reference shifted to a negative coordinate becomes `#REF!`.
+pub fn translate(expr: &Expr, dcol: i64, drow: i64) -> Expr {
+    match expr {
+        Expr::Ref(r) => match shift_ref(*r, dcol, drow) {
+            Some(nr) => Expr::Ref(nr),
+            None => Expr::RefError,
+        },
+        Expr::Range(range) => match shift_range(*range, dcol, drow) {
+            Some(nr) => Expr::Range(nr),
+            None => Expr::RefError,
+        },
+        Expr::SheetRef(sheet, r) => match shift_ref(*r, dcol, drow) {
+            Some(nr) => Expr::SheetRef(sheet.clone(), nr),
+            None => Expr::RefError,
+        },
+        Expr::SheetRange(sheet, range) => match shift_range(*range, dcol, drow) {
+            Some(nr) => Expr::SheetRange(sheet.clone(), nr),
+            None => Expr::RefError,
+        },
+        Expr::Neg(inner) => Expr::Neg(Box::new(translate(inner, dcol, drow))),
+        Expr::Percent(inner) => Expr::Percent(Box::new(translate(inner, dcol, drow))),
+        Expr::Binary(op, a, b) => Expr::Binary(
+            *op,
+            Box::new(translate(a, dcol, drow)),
+            Box::new(translate(b, dcol, drow)),
+        ),
+        Expr::Func(name, args) => Expr::Func(
+            name.clone(),
+            args.iter().map(|a| translate(a, dcol, drow)).collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn shift_ref(r: CellRef, dcol: i64, drow: i64) -> Option<CellRef> {
+    let col = if r.col_abs {
+        r.col as i64
+    } else {
+        r.col as i64 + dcol
+    };
+    let row = if r.row_abs {
+        r.row as i64
+    } else {
+        r.row as i64 + drow
+    };
+    if col < 0 || row < 0 {
+        return None;
+    }
+    Some(CellRef {
+        col: col as u32,
+        row: row as u32,
+        ..r
+    })
+}
+
+fn shift_range(range: CellRange, dcol: i64, drow: i64) -> Option<CellRange> {
+    Some(CellRange {
+        start: shift_ref(range.start, dcol, drow)?,
+        end: shift_ref(range.end, dcol, drow)?,
+    })
+}
+
 // ----------------------------------------------------------------------------
 // Tokenizer
 // ----------------------------------------------------------------------------
