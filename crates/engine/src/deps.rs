@@ -115,8 +115,14 @@ fn walk(expr: &Expr, out: &mut HashSet<CellKey>) {
                 out.insert(key(&c));
             }
         }
-        // Cross-sheet references are not part of the local graph.
-        Expr::SheetRef(_, _) | Expr::SheetRange(_, _) => {}
+        // Cross-sheet references and unbounded whole-column / whole-row spans
+        // are not enumerated in the cell-keyed local graph. (A formula using
+        // `A:A` is therefore not finely incremental — the batch evaluator stays
+        // correct, but RecalcEngine may not auto-dirty it when column A grows.)
+        Expr::SheetRef(_, _)
+        | Expr::SheetRange(_, _)
+        | Expr::ColSpan { .. }
+        | Expr::RowSpan { .. } => {}
         Expr::Neg(inner) | Expr::Percent(inner) => walk(inner, out),
         Expr::Binary(_, a, b) => {
             walk(a, out);

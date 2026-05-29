@@ -34,6 +34,16 @@ pub enum Expr {
     SheetRef(String, CellRef),
     /// A range qualified by a sheet name (`Sheet2!A1:B3`).
     SheetRange(String, CellRange),
+    /// A whole-column span like `A:C` — every row of columns `start..=end`.
+    ColSpan {
+        start: u32,
+        end: u32,
+    },
+    /// A whole-row span like `1:5` — every column of rows `start..=end`.
+    RowSpan {
+        start: u32,
+        end: u32,
+    },
     /// A bareword that isn't a recognized reference — a named range or an
     /// undefined name. Resolved (or rejected as `#NAME?`) at evaluation time.
     Name(String),
@@ -97,6 +107,12 @@ fn render(expr: &Expr, parent: u8) -> String {
         Expr::Range(range) => range.to_string(),
         Expr::SheetRef(sheet, r) => format!("{}!{}", quote_sheet(sheet), r.to_a1()),
         Expr::SheetRange(sheet, range) => format!("{}!{}", quote_sheet(sheet), range),
+        Expr::ColSpan { start, end } => format!(
+            "{}:{}",
+            crate::address::index_to_column(*start),
+            crate::address::index_to_column(*end)
+        ),
+        Expr::RowSpan { start, end } => format!("{}:{}", start + 1, end + 1),
         Expr::Name(name) => name.clone(),
         Expr::RefError => "#REF!".to_string(),
         Expr::Neg(inner) => format!("-{}", render(inner, prec)),
@@ -175,6 +191,18 @@ pub fn translate(expr: &Expr, dcol: i64, drow: i64) -> Expr {
             Some(nr) => Expr::SheetRange(sheet.clone(), nr),
             None => Expr::RefError,
         },
+        Expr::ColSpan { start, end } => {
+            match (shift_index(*start, dcol), shift_index(*end, dcol)) {
+                (Some(s), Some(e)) => Expr::ColSpan { start: s, end: e },
+                _ => Expr::RefError,
+            }
+        }
+        Expr::RowSpan { start, end } => {
+            match (shift_index(*start, drow), shift_index(*end, drow)) {
+                (Some(s), Some(e)) => Expr::RowSpan { start: s, end: e },
+                _ => Expr::RefError,
+            }
+        }
         Expr::Neg(inner) => Expr::Neg(Box::new(translate(inner, dcol, drow))),
         Expr::Percent(inner) => Expr::Percent(Box::new(translate(inner, dcol, drow))),
         Expr::Binary(op, a, b) => Expr::Binary(
@@ -187,6 +215,15 @@ pub fn translate(expr: &Expr, dcol: i64, drow: i64) -> Expr {
             args.iter().map(|a| translate(a, dcol, drow)).collect(),
         ),
         other => other.clone(),
+    }
+}
+
+fn shift_index(idx: u32, delta: i64) -> Option<u32> {
+    let v = idx as i64 + delta;
+    if v < 0 {
+        None
+    } else {
+        Some(v as u32)
     }
 }
 
@@ -549,7 +586,22 @@ impl Parser {
 
     fn parse_primary(&mut self) -> Result<Expr> {
         match self.advance() {
-            Some(Token::Number(n)) => Ok(Expr::Number(n)),
+            Some(Token::Number(n)) => {
+                // Whole-row span: N ':' M (1-based row numbers).
+                if self.peek() == Some(&Token::Colon) {
+                    if let Some(Token::Number(m)) = self.tokens.get(self.pos + 1).cloned() {
+                        if let (Some(r1), Some(r2)) = (row_index(n), row_index(m)) {
+                            self.advance(); // ':'
+                            self.advance(); // M
+                            return Ok(Expr::RowSpan {
+                                start: r1.min(r2),
+                                end: r1.max(r2),
+                            });
+                        }
+                    }
+                }
+                Ok(Expr::Number(n))
+            }
             Some(Token::Str(s)) => Ok(Expr::Text(s)),
             Some(Token::LParen) => {
                 let inner = self.parse_expr()?;
@@ -580,6 +632,23 @@ impl Parser {
         if self.peek() == Some(&Token::Bang) {
             self.advance();
             return self.parse_sheet_qualified(word);
+        }
+
+        // Whole-column span: COL ':' COL (e.g. A:A, A:C) — only when both sides
+        // are column-letter-only words.
+        if self.peek() == Some(&Token::Colon) {
+            if let Some(c1) = column_only(&word) {
+                if let Some(Token::Word(w2)) = self.tokens.get(self.pos + 1).cloned() {
+                    if let Some(c2) = column_only(&w2) {
+                        self.advance(); // ':'
+                        self.advance(); // second column
+                        return Ok(Expr::ColSpan {
+                            start: c1.min(c2),
+                            end: c1.max(c2),
+                        });
+                    }
+                }
+            }
         }
 
         // Range: WORD ':' WORD where both sides are references.
@@ -652,6 +721,27 @@ impl Parser {
             }
         }
         Ok(args)
+    }
+}
+
+/// If `word` is column letters only (optionally `$`-prefixed), return its
+/// zero-based column index. Rejects anything containing digits (so `A1` is not
+/// treated as a column).
+fn column_only(word: &str) -> Option<u32> {
+    let letters = word.strip_prefix('$').unwrap_or(word);
+    if letters.is_empty() || !letters.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    crate::address::column_to_index(letters)
+}
+
+/// Convert a 1-based row number literal to a zero-based index, if it is a
+/// positive integer.
+fn row_index(n: f64) -> Option<u32> {
+    if n.fract() == 0.0 && n >= 1.0 && n <= u32::MAX as f64 {
+        Some(n as u32 - 1)
+    } else {
+        None
     }
 }
 
@@ -770,6 +860,29 @@ mod tests {
                 assert_eq!(r.to_a1(), "B2");
             }
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_whole_column_and_row_spans() {
+        assert_eq!(p("A:A"), Expr::ColSpan { start: 0, end: 0 });
+        assert_eq!(p("A:C"), Expr::ColSpan { start: 0, end: 2 });
+        assert_eq!(p("2:5"), Expr::RowSpan { start: 1, end: 4 });
+        match p("SUM(B:B)") {
+            Expr::Func(name, args) => {
+                assert_eq!(name, "SUM");
+                assert_eq!(args[0], Expr::ColSpan { start: 1, end: 1 });
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // A normal cell range still parses as a range, not a span.
+        assert!(matches!(p("A1:A3"), Expr::Range(_)));
+    }
+
+    #[test]
+    fn span_unparse_roundtrips() {
+        for s in ["A:A", "A:C", "2:5"] {
+            assert_eq!(unparse(&p(s)), s);
         }
     }
 

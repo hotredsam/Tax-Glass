@@ -24,6 +24,12 @@ pub trait Cells {
     fn resolve_name(&self, _name: &str) -> Option<(usize, crate::address::CellRange)> {
         None
     }
+    /// The `(cols, rows)` used extent of a sheet, used to bound whole-column /
+    /// whole-row spans during evaluation.
+    fn dimensions(&self, sheet: usize) -> (u32, u32) {
+        let _ = sheet;
+        (0, 0)
+    }
 }
 
 impl Cells for Sheet {
@@ -42,6 +48,14 @@ impl Cells for Sheet {
             None
         }
     }
+
+    fn dimensions(&self, sheet: usize) -> (u32, u32) {
+        if sheet == 0 {
+            Sheet::dimensions(self)
+        } else {
+            (0, 0)
+        }
+    }
 }
 
 impl Cells for Workbook {
@@ -55,6 +69,12 @@ impl Cells for Workbook {
 
     fn resolve_name(&self, name: &str) -> Option<(usize, crate::address::CellRange)> {
         self.resolve_defined_name(name)
+    }
+
+    fn dimensions(&self, sheet: usize) -> (u32, u32) {
+        self.sheet_at(sheet)
+            .map(|s| s.dimensions())
+            .unwrap_or((0, 0))
     }
 }
 
@@ -168,8 +188,11 @@ impl<'a> Evaluator<'a> {
                 Some(idx) => self.value_at(idx, r.col, r.row),
                 None => Value::Error(CellError::Ref),
             },
-            // A bare range used as a scalar has no implicit intersection here.
-            Expr::Range(_) | Expr::SheetRange(_, _) => Value::Error(CellError::Value),
+            // A bare range/span used as a scalar has no implicit intersection.
+            Expr::Range(_)
+            | Expr::SheetRange(_, _)
+            | Expr::ColSpan { .. }
+            | Expr::RowSpan { .. } => Value::Error(CellError::Value),
             Expr::Name(name) => match self.cells.resolve_name(name) {
                 // A 1×1 named range resolves to that cell's value; a larger one
                 // is a range and has no scalar meaning here.
@@ -270,6 +293,30 @@ impl<'a> Evaluator<'a> {
                     .collect(),
                 None => vec![Value::Error(CellError::Ref)],
             },
+            // Whole-column / whole-row spans expand over the sheet's used extent
+            // (blanks contribute nothing to numeric aggregates, just as in Excel).
+            Expr::ColSpan { start, end } => {
+                let (_, rows) = self.cells.dimensions(self.current);
+                let sheet = self.current;
+                let mut out = Vec::new();
+                for col in *start..=*end {
+                    for row in 0..rows {
+                        out.push(self.value_at(sheet, col, row));
+                    }
+                }
+                out
+            }
+            Expr::RowSpan { start, end } => {
+                let (cols, _) = self.cells.dimensions(self.current);
+                let sheet = self.current;
+                let mut out = Vec::new();
+                for row in *start..=*end {
+                    for col in 0..cols {
+                        out.push(self.value_at(sheet, col, row));
+                    }
+                }
+                out
+            }
             // A named range expands to its target cells when used as an argument.
             Expr::Name(name) => match self.cells.resolve_name(name) {
                 Some((idx, range)) => range
@@ -688,6 +735,28 @@ mod tests {
             ("A4", "=A3^2"),
         ]);
         assert_eq!(val(&s, "A4"), Value::Number(64.0));
+    }
+
+    #[test]
+    fn whole_column_and_row_spans_aggregate_used_extent() {
+        let s = sheet_with(&[
+            ("A1", "1"),
+            ("A2", "2"),
+            ("A3", "3"),
+            ("B1", "10"),
+            ("C1", "=SUM(A:A)"),
+            ("C2", "=SUM(1:1)"),
+        ]);
+        // SUM over column A = 1+2+3 = 6.
+        assert_eq!(val(&s, "C1"), Value::Number(6.0));
+        // SUM over row 1 = A1 + B1 (+ C1 which is a formula = 6) = 1+10+6 = 17.
+        assert_eq!(val(&s, "C2"), Value::Number(17.0));
+    }
+
+    #[test]
+    fn span_as_scalar_is_value_error() {
+        let s = sheet_with(&[("A1", "5"), ("B1", "=A:A")]);
+        assert_eq!(val(&s, "B1"), Value::Error(CellError::Value));
     }
 
     #[test]

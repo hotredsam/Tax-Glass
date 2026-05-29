@@ -359,8 +359,49 @@ fn adjust_expr(expr: &Expr, axis: Axis, edit: &Edit) -> Expr {
             name.clone(),
             args.iter().map(|a| adjust_expr(a, axis, edit)).collect(),
         ),
-        // Literals, sheet-qualified refs, names, and existing #REF! pass through.
+        // A whole-column span tracks column inserts/deletes; whole-row tracks
+        // row edits. On the other axis they are unaffected.
+        Expr::ColSpan { start, end } if axis == Axis::Col => {
+            match adjust_span(*start, *end, edit) {
+                Some((s, e)) => Expr::ColSpan { start: s, end: e },
+                None => Expr::RefError,
+            }
+        }
+        Expr::RowSpan { start, end } if axis == Axis::Row => {
+            match adjust_span(*start, *end, edit) {
+                Some((s, e)) => Expr::RowSpan { start: s, end: e },
+                None => Expr::RefError,
+            }
+        }
+        // Literals, sheet-qualified refs, names, off-axis spans, and existing
+        // #REF! pass through unchanged.
         other => other.clone(),
+    }
+}
+
+/// Adjust a span's `start..=end` indices for an edit, clamping deleted
+/// endpoints to the surviving boundary. `None` if the whole span is deleted.
+fn adjust_span(start: u32, end: u32, edit: &Edit) -> Option<(u32, u32)> {
+    match *edit {
+        Edit::Insert { .. } => Some((edit.map(start)?, edit.map(end)?)),
+        Edit::Delete { at, count } => {
+            let start_deleted = start >= at && start < at + count;
+            let end_deleted = end >= at && end < at + count;
+            if start_deleted && end_deleted {
+                return None;
+            }
+            let s = if start_deleted { at } else { edit.map(start)? };
+            let e = if end_deleted {
+                at.saturating_sub(1)
+            } else {
+                edit.map(end)?
+            };
+            if s > e {
+                None
+            } else {
+                Some((s, e))
+            }
+        }
     }
 }
 
