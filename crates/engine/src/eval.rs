@@ -574,6 +574,12 @@ impl<'a> Evaluator<'a> {
                 Err(e) => Value::Error(e),
                 Ok(ns) => Value::Number(ns.len() as f64),
             },
+            "SUMIF" => self.func_sumif(args),
+            "AVERAGEIF" => self.func_averageif(args),
+            "COUNTIF" => self.func_countif(args),
+            "SUMIFS" => self.func_ifs(args, IfsKind::Sum),
+            "AVERAGEIFS" => self.func_ifs(args, IfsKind::Average),
+            "COUNTIFS" => self.func_ifs(args, IfsKind::Count),
             "COUNTA" => {
                 let mut count = 0;
                 for arg in args {
@@ -655,6 +661,138 @@ impl<'a> Evaluator<'a> {
             "TRIM" => self.scalar_text1(args, |s| Value::Text(s.trim().to_string())),
 
             _ => Value::Error(CellError::Name),
+        }
+    }
+
+    // --- conditional aggregation ---
+
+    /// `SUMIF(range, criteria, [sum_range])`.
+    fn func_sumif(&mut self, args: &[Expr]) -> Value {
+        if args.len() < 2 || args.len() > 3 {
+            return Value::Error(CellError::Value);
+        }
+        let test = self.flatten(&args[0]);
+        let criteria = self.eval(&args[1]);
+        let sum_vals = if args.len() == 3 {
+            self.flatten(&args[2])
+        } else {
+            test.clone()
+        };
+        let mut total = 0.0;
+        for (i, t) in test.iter().enumerate() {
+            if let Value::Error(e) = t {
+                return Value::Error(*e);
+            }
+            if criteria_matches(t, &criteria) {
+                if let Some(Ok(n)) = sum_vals.get(i).map(|v| v.as_number()) {
+                    total += n;
+                }
+            }
+        }
+        Value::Number(total)
+    }
+
+    /// `COUNTIF(range, criteria)`.
+    fn func_countif(&mut self, args: &[Expr]) -> Value {
+        if args.len() != 2 {
+            return Value::Error(CellError::Value);
+        }
+        let test = self.flatten(&args[0]);
+        let criteria = self.eval(&args[1]);
+        let count = test
+            .iter()
+            .filter(|t| criteria_matches(t, &criteria))
+            .count();
+        Value::Number(count as f64)
+    }
+
+    /// `AVERAGEIF(range, criteria, [avg_range])`.
+    fn func_averageif(&mut self, args: &[Expr]) -> Value {
+        if args.len() < 2 || args.len() > 3 {
+            return Value::Error(CellError::Value);
+        }
+        let test = self.flatten(&args[0]);
+        let criteria = self.eval(&args[1]);
+        let avg_vals = if args.len() == 3 {
+            self.flatten(&args[2])
+        } else {
+            test.clone()
+        };
+        let mut sum = 0.0;
+        let mut count = 0u32;
+        for (i, t) in test.iter().enumerate() {
+            if criteria_matches(t, &criteria) {
+                if let Some(Ok(n)) = avg_vals.get(i).map(|v| v.as_number()) {
+                    sum += n;
+                    count += 1;
+                }
+            }
+        }
+        if count == 0 {
+            Value::Error(CellError::Div0)
+        } else {
+            Value::Number(sum / count as f64)
+        }
+    }
+
+    /// The `*IFS` family: `SUMIFS(sum_range, crit_range, crit, ...)`,
+    /// `COUNTIFS(crit_range, crit, ...)`, `AVERAGEIFS(avg_range, ...)`.
+    fn func_ifs(&mut self, args: &[Expr], kind: IfsKind) -> Value {
+        // COUNTIFS has only (range, criteria) pairs; the others lead with the
+        // aggregation range.
+        let (agg, pairs): (Option<Vec<Value>>, &[Expr]) = match kind {
+            IfsKind::Count => (None, args),
+            _ => {
+                if args.is_empty() {
+                    return Value::Error(CellError::Value);
+                }
+                (Some(self.flatten(&args[0])), &args[1..])
+            }
+        };
+        if pairs.is_empty() || pairs.len() % 2 != 0 {
+            return Value::Error(CellError::Value);
+        }
+
+        // Evaluate each (range, criteria) pair.
+        let mut tests: Vec<(Vec<Value>, Value)> = Vec::new();
+        let mut len = agg.as_ref().map(|a| a.len());
+        let mut i = 0;
+        while i < pairs.len() {
+            let range = self.flatten(&pairs[i]);
+            let criteria = self.eval(&pairs[i + 1]);
+            len = Some(len.unwrap_or(range.len()).min(range.len()));
+            tests.push((range, criteria));
+            i += 2;
+        }
+        let len = len.unwrap_or(0);
+
+        let mut sum = 0.0;
+        let mut count = 0u32;
+        for idx in 0..len {
+            let all = tests
+                .iter()
+                .all(|(range, crit)| range.get(idx).is_some_and(|v| criteria_matches(v, crit)));
+            if !all {
+                continue;
+            }
+            count += 1;
+            if let Some(agg) = &agg {
+                if let Some(Ok(n)) = agg.get(idx).map(|v| v.as_number()) {
+                    sum += n;
+                }
+            }
+        }
+
+        match kind {
+            IfsKind::Count => Value::Number(count as f64),
+            IfsKind::Sum => Value::Number(sum),
+            IfsKind::Average => {
+                if count == 0 {
+                    Value::Error(CellError::Div0)
+                } else {
+                    Value::Number(sum / count as f64)
+                }
+            }
         }
     }
 
@@ -795,6 +933,83 @@ enum RoundMode {
     Half,
     Up,
     Down,
+}
+
+/// Which conditional aggregate an `*IFS` call computes.
+#[derive(Clone, Copy)]
+enum IfsKind {
+    Sum,
+    Average,
+    Count,
+}
+
+/// Match a value against an Excel criteria string/number, e.g. `">5"`, `"<>0"`,
+/// `"apple"`, `"a*"` (with `*`/`?` wildcards on equality).
+fn criteria_matches(value: &Value, criteria: &Value) -> bool {
+    let raw = criteria.as_text();
+    let raw = raw.trim();
+    let (op, operand) = split_criteria_op(raw);
+
+    if let Ok(n) = operand.parse::<f64>() {
+        return match value.as_number() {
+            Ok(v) => compare_num(v, op, n),
+            Err(_) => false,
+        };
+    }
+
+    let text = value.as_text();
+    match op {
+        "<>" => !wildcard_eq(&text, operand),
+        "=" | "" => wildcard_eq(&text, operand),
+        ">" => text.to_lowercase() > operand.to_lowercase(),
+        ">=" => text.to_lowercase() >= operand.to_lowercase(),
+        "<" => text.to_lowercase() < operand.to_lowercase(),
+        "<=" => text.to_lowercase() <= operand.to_lowercase(),
+        _ => false,
+    }
+}
+
+/// Split a leading comparison operator off a criteria string.
+fn split_criteria_op(s: &str) -> (&str, &str) {
+    for op in [">=", "<=", "<>", ">", "<", "="] {
+        if let Some(rest) = s.strip_prefix(op) {
+            return (op, rest.trim());
+        }
+    }
+    ("", s)
+}
+
+fn compare_num(v: f64, op: &str, n: f64) -> bool {
+    match op {
+        "" | "=" => v == n,
+        "<>" => v != n,
+        ">" => v > n,
+        ">=" => v >= n,
+        "<" => v < n,
+        "<=" => v <= n,
+        _ => false,
+    }
+}
+
+/// Case-insensitive equality with `*` (any run) and `?` (any char) wildcards.
+fn wildcard_eq(text: &str, pattern: &str) -> bool {
+    let t: Vec<char> = text.to_lowercase().chars().collect();
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    wildcard_match(&t, &p)
+}
+
+fn wildcard_match(t: &[char], p: &[char]) -> bool {
+    if p.is_empty() {
+        return t.is_empty();
+    }
+    match p[0] {
+        '*' => {
+            // Match zero or more, then the rest.
+            wildcard_match(t, &p[1..]) || (!t.is_empty() && wildcard_match(&t[1..], p))
+        }
+        '?' => !t.is_empty() && wildcard_match(&t[1..], &p[1..]),
+        c => !t.is_empty() && t[0] == c && wildcard_match(&t[1..], &p[1..]),
+    }
 }
 
 /// Order two values. Numbers compare numerically; text compares
@@ -942,6 +1157,32 @@ mod tests {
             ("A4", "=A3^2"),
         ]);
         assert_eq!(val(&s, "A4"), Value::Number(64.0));
+    }
+
+    #[test]
+    fn conditional_aggregation_functions() {
+        let s = sheet_with(&[
+            ("A1", "apple"),
+            ("B1", "10"),
+            ("A2", "banana"),
+            ("B2", "20"),
+            ("A3", "apricot"),
+            ("B3", "30"),
+            ("A4", "cherry"),
+            ("B4", "40"),
+            ("C1", "=SUMIF(B1:B4, \">15\")"),
+            ("C2", "=COUNTIF(A1:A4, \"a*\")"),
+            ("C3", "=SUMIF(A1:A4, \"a*\", B1:B4)"),
+            ("C4", "=AVERAGEIF(B1:B4, \">=20\")"),
+            ("C5", "=SUMIFS(B1:B4, A1:A4, \"a*\", B1:B4, \">10\")"),
+            ("C6", "=COUNTIFS(B1:B4, \">10\", B1:B4, \"<40\")"),
+        ]);
+        assert_eq!(val(&s, "C1"), Value::Number(90.0)); // 20+30+40
+        assert_eq!(val(&s, "C2"), Value::Number(2.0)); // apple, apricot
+        assert_eq!(val(&s, "C3"), Value::Number(40.0)); // 10+30
+        assert_eq!(val(&s, "C4"), Value::Number(30.0)); // (20+30+40)/3
+        assert_eq!(val(&s, "C5"), Value::Number(30.0)); // apricot only (apple's 10 not >10)
+        assert_eq!(val(&s, "C6"), Value::Number(2.0)); // 20, 30
     }
 
     #[test]
