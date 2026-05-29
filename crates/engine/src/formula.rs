@@ -50,6 +50,8 @@ pub enum Expr {
     /// A reference that was invalidated by a structural edit (a deleted row or
     /// column). Evaluates to `#REF!`, mirroring Excel.
     RefError,
+    /// An array literal `{1,2;3,4}` (row-major: outer = rows, inner = columns).
+    Array(Vec<Vec<Expr>>),
     Neg(Box<Expr>),
     /// Postfix `%` — divides by 100.
     Percent(Box<Expr>),
@@ -136,6 +138,19 @@ fn render(expr: &Expr, parent: u8, style: RefStyle) -> String {
         },
         Expr::Name(name) => name.clone(),
         Expr::RefError => "#REF!".to_string(),
+        Expr::Array(rows) => {
+            let body = rows
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        .map(|e| render(e, 0, style))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+            format!("{{{body}}}")
+        }
         Expr::Neg(inner) => format!("-{}", render(inner, prec, style)),
         Expr::Percent(inner) => format!("{}%", render(inner, prec, style)),
         Expr::Binary(op, lhs, rhs) => {
@@ -251,6 +266,11 @@ pub fn translate(expr: &Expr, dcol: i64, drow: i64) -> Expr {
             name.clone(),
             args.iter().map(|a| translate(a, dcol, drow)).collect(),
         ),
+        Expr::Array(rows) => Expr::Array(
+            rows.iter()
+                .map(|r| r.iter().map(|e| translate(e, dcol, drow)).collect())
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
@@ -314,6 +334,9 @@ enum Token {
     Percent,
     LParen,
     RParen,
+    LBrace,
+    RBrace,
+    Semicolon,
     Comma,
     Colon,
     Eq,
@@ -366,6 +389,18 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
             }
             ')' => {
                 tokens.push(Token::RParen);
+                i += 1;
+            }
+            '{' => {
+                tokens.push(Token::LBrace);
+                i += 1;
+            }
+            '}' => {
+                tokens.push(Token::RBrace);
+                i += 1;
+            }
+            ';' => {
+                tokens.push(Token::Semicolon);
                 i += 1;
             }
             ',' => {
@@ -645,6 +680,7 @@ impl Parser {
                 self.expect(&Token::RParen)?;
                 Ok(inner)
             }
+            Some(Token::LBrace) => self.parse_array_literal(),
             Some(Token::Word(w)) => self.parse_word(w),
             Some(Token::Quoted(name)) => {
                 // A quoted name is only meaningful as a sheet qualifier.
@@ -741,6 +777,30 @@ impl Parser {
         } else {
             Ok(Expr::SheetRef(sheet, start))
         }
+    }
+
+    /// Parse an array literal with the opening `{` already consumed: elements
+    /// separated by `,`, rows by `;`.
+    fn parse_array_literal(&mut self) -> Result<Expr> {
+        let mut rows = Vec::new();
+        let mut current = Vec::new();
+        loop {
+            current.push(self.parse_expr()?);
+            match self.advance() {
+                Some(Token::Comma) => {}
+                Some(Token::Semicolon) => rows.push(std::mem::take(&mut current)),
+                Some(Token::RBrace) => {
+                    rows.push(current);
+                    break;
+                }
+                other => {
+                    return Err(EngineError::Syntax(format!(
+                        "unexpected token in array literal: {other:?}"
+                    )))
+                }
+            }
+        }
+        Ok(Expr::Array(rows))
     }
 
     fn parse_args(&mut self) -> Result<Vec<Expr>> {
@@ -921,6 +981,19 @@ mod tests {
         for s in ["A:A", "A:C", "2:5"] {
             assert_eq!(unparse(&p(s)), s);
         }
+    }
+
+    #[test]
+    fn parses_and_unparses_array_literals() {
+        match p("{1,2;3,4}") {
+            Expr::Array(rows) => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].len(), 2);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(unparse(&p("{1,2;3,4}")), "{1,2;3,4}");
+        assert_eq!(unparse(&p("{1,2,3}")), "{1,2,3}");
     }
 
     #[test]

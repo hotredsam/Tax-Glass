@@ -19,6 +19,8 @@ pub enum CellError {
     Num,
     /// Value not available — `#N/A`.
     NA,
+    /// A dynamic-array result was blocked from spilling — `#SPILL!`.
+    Spill,
     /// Circular reference — `#CIRC!` (Excel reports this separately; we model it
     /// as a propagating value).
     Circular,
@@ -34,6 +36,7 @@ impl CellError {
             CellError::Name => "#NAME?",
             CellError::Num => "#NUM!",
             CellError::NA => "#N/A",
+            CellError::Spill => "#SPILL!",
             CellError::Circular => "#CIRC!",
         }
     }

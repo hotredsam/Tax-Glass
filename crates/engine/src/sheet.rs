@@ -371,6 +371,11 @@ fn adjust_expr(expr: &Expr, axis: Axis, edit: &Edit) -> Expr {
             name.clone(),
             args.iter().map(|a| adjust_expr(a, axis, edit)).collect(),
         ),
+        Expr::Array(rows) => Expr::Array(
+            rows.iter()
+                .map(|r| r.iter().map(|e| adjust_expr(e, axis, edit)).collect())
+                .collect(),
+        ),
         // A whole-column span tracks column inserts/deletes; whole-row tracks
         // row edits. On the other axis they are unaffected.
         Expr::ColSpan { start, end } if axis == Axis::Col => {

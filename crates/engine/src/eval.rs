@@ -78,15 +78,101 @@ impl Cells for Workbook {
     }
 }
 
-/// Compute the value of every populated cell in a single sheet.
+/// Compute the value of every populated cell in a single sheet, including
+/// dynamic-array spilling: a bare-range or array-literal formula spills its grid
+/// into neighboring cells, reporting `#SPILL!` if blocked.
 pub fn evaluate_sheet(sheet: &Sheet) -> HashMap<(u32, u32), Value> {
+    use crate::sheet::CellContent;
+
     let mut ev = Evaluator::new(sheet);
     let keys: Vec<(u32, u32)> = sheet.iter().map(|(k, _)| *k).collect();
-    let mut out = HashMap::with_capacity(keys.len());
-    for (col, row) in keys {
-        out.insert((col, row), ev.value_at(0, col, row));
+    let mut out: HashMap<(u32, u32), Value> = HashMap::with_capacity(keys.len());
+    // Cells filled by a spill, mapped back to the anchor that produced them.
+    let mut spilled: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
+
+    // Phase 1: anchors whose top-level result is an array.
+    for &(col, row) in &keys {
+        let Some(CellContent::Formula { ast, .. }) = sheet.content(col, row) else {
+            continue;
+        };
+        if !is_array_top(ast) {
+            continue;
+        }
+        let ast = ast.clone();
+        let grid = ev.eval_array(&ast);
+        let rows = grid.len() as u32;
+        let cols = grid.first().map(|r| r.len()).unwrap_or(0) as u32;
+
+        // A degenerate 1×1 array just behaves as a scalar.
+        if rows <= 1 && cols <= 1 {
+            let v = grid
+                .into_iter()
+                .next()
+                .and_then(|r| r.into_iter().next())
+                .unwrap_or(Value::Empty);
+            ev.cache.insert((0, col, row), v.clone());
+            out.insert((col, row), v);
+            continue;
+        }
+
+        if spill_blocked(sheet, &spilled, (col, row), rows, cols) {
+            let v = Value::Error(CellError::Spill);
+            ev.cache.insert((0, col, row), v.clone());
+            out.insert((col, row), v);
+            continue;
+        }
+
+        for (r, line) in grid.into_iter().enumerate() {
+            for (c, value) in line.into_iter().enumerate() {
+                let pos = (col + c as u32, row + r as u32);
+                ev.cache.insert((0, pos.0, pos.1), value.clone());
+                out.insert(pos, value);
+                if pos != (col, row) {
+                    spilled.insert(pos, (col, row));
+                }
+            }
+        }
     }
+
+    // Phase 2: everything else (scalars + literals), reusing the seeded cache so
+    // formulas that reference spilled cells see their values.
+    for &(col, row) in &keys {
+        out.entry((col, row))
+            .or_insert_with(|| ev.value_at(0, col, row));
+    }
+
     out
+}
+
+/// Whether a formula's top-level result spills (bare range or array literal).
+fn is_array_top(ast: &Expr) -> bool {
+    matches!(
+        ast,
+        Expr::Range(_) | Expr::SheetRange(_, _) | Expr::Array(_)
+    )
+}
+
+/// True if a spill region (other than its anchor) would overwrite a stored cell
+/// or a region already claimed by another spill.
+fn spill_blocked(
+    sheet: &Sheet,
+    spilled: &HashMap<(u32, u32), (u32, u32)>,
+    anchor: (u32, u32),
+    rows: u32,
+    cols: u32,
+) -> bool {
+    for r in 0..rows {
+        for c in 0..cols {
+            let pos = (anchor.0 + c, anchor.1 + r);
+            if pos == anchor {
+                continue;
+            }
+            if sheet.content(pos.0, pos.1).is_some() || spilled.contains_key(&pos) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Incrementally evaluate a set of target cells on a single sheet, seeding the
@@ -291,6 +377,11 @@ impl<'a> Evaluator<'a> {
                 None => Value::Error(CellError::Name),
             },
             Expr::RefError => Value::Error(CellError::Ref),
+            // An array in a scalar slot collapses to its top-left element.
+            Expr::Array(rows) => match rows.first().and_then(|r| r.first()) {
+                Some(e) => self.eval(e),
+                None => Value::Empty,
+            },
             Expr::Neg(inner) => match self.eval(inner).as_number() {
                 Ok(n) => Value::Number(-n),
                 Err(e) => Value::Error(e),
@@ -413,8 +504,36 @@ impl<'a> Evaluator<'a> {
                     .collect(),
                 None => vec![Value::Error(CellError::Name)],
             },
+            Expr::Array(rows) => rows.iter().flatten().map(|e| self.eval(e)).collect(),
             other => vec![self.eval(other)],
         }
+    }
+
+    /// Evaluate an expression to a 2-D array (rows × cols) for spilling. Array
+    /// literals and bounded ranges produce real grids; anything else is a 1×1.
+    fn eval_array(&mut self, expr: &Expr) -> Vec<Vec<Value>> {
+        match expr {
+            Expr::Array(rows) => rows
+                .iter()
+                .map(|r| r.iter().map(|e| self.eval(e)).collect())
+                .collect(),
+            Expr::Range(range) => self.range_array(self.current, range),
+            Expr::SheetRange(name, range) => match self.sheet_index(name) {
+                Some(idx) => self.range_array(idx, range),
+                None => vec![vec![Value::Error(CellError::Ref)]],
+            },
+            other => vec![vec![self.eval(other)]],
+        }
+    }
+
+    fn range_array(&mut self, sheet: usize, range: &crate::address::CellRange) -> Vec<Vec<Value>> {
+        (range.start.row..=range.end.row)
+            .map(|row| {
+                (range.start.col..=range.end.col)
+                    .map(|col| self.value_at(sheet, col, row))
+                    .collect()
+            })
+            .collect()
     }
 
     /// Collect the numeric values from arguments, skipping blanks and
@@ -823,6 +942,47 @@ mod tests {
             ("A4", "=A3^2"),
         ]);
         assert_eq!(val(&s, "A4"), Value::Number(64.0));
+    }
+
+    #[test]
+    fn bare_range_formula_spills() {
+        let mut s = sheet_with(&[("A1", "1"), ("A2", "2"), ("A3", "3")]);
+        s.set_formula(r("C1"), "=A1:A3").unwrap();
+        let grid = s.evaluate();
+        // The array spills from C1 down into C2 and C3.
+        assert_eq!(grid[&(2, 0)], Value::Number(1.0));
+        assert_eq!(grid[&(2, 1)], Value::Number(2.0));
+        assert_eq!(grid[&(2, 2)], Value::Number(3.0));
+    }
+
+    #[test]
+    fn array_literal_spills_2d() {
+        let mut s = Sheet::new("Sheet1");
+        s.set_formula(r("A1"), "={1,2;3,4}").unwrap();
+        let grid = s.evaluate();
+        assert_eq!(grid[&(0, 0)], Value::Number(1.0));
+        assert_eq!(grid[&(1, 0)], Value::Number(2.0));
+        assert_eq!(grid[&(0, 1)], Value::Number(3.0));
+        assert_eq!(grid[&(1, 1)], Value::Number(4.0));
+    }
+
+    #[test]
+    fn blocked_spill_reports_spill_error() {
+        let mut s = sheet_with(&[("A1", "1"), ("A2", "2"), ("C2", "obstacle")]);
+        s.set_formula(r("C1"), "=A1:A2").unwrap();
+        let grid = s.evaluate();
+        // C2 is occupied, so the spill is blocked.
+        assert_eq!(grid[&(2, 0)], Value::Error(CellError::Spill));
+        assert_eq!(grid[&(2, 1)], Value::Text("obstacle".into()));
+    }
+
+    #[test]
+    fn spilled_values_are_referenceable() {
+        let mut s = sheet_with(&[("A1", "5"), ("A2", "6")]);
+        s.set_formula(r("C1"), "=A1:A2").unwrap(); // spills to C1,C2
+        s.set_formula(r("E1"), "=C2+1").unwrap(); // references a spilled cell
+        let grid = s.evaluate();
+        assert_eq!(grid[&(4, 0)], Value::Number(7.0));
     }
 
     #[test]

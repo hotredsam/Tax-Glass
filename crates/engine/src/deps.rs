@@ -133,6 +133,11 @@ fn walk(expr: &Expr, out: &mut HashSet<CellKey>) {
                 walk(a, out);
             }
         }
+        Expr::Array(rows) => {
+            for e in rows.iter().flatten() {
+                walk(e, out);
+            }
+        }
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Name(_) | Expr::RefError => {}
     }
 }
