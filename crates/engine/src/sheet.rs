@@ -5,6 +5,7 @@ use crate::address::{CellRange, CellRef};
 use crate::error::Result;
 use crate::eval::evaluate_sheet;
 use crate::formula::{self, Expr};
+use crate::style::CellStyle;
 use crate::value::Value;
 use std::collections::HashMap;
 
@@ -55,6 +56,7 @@ pub enum CellContent {
 pub struct Sheet {
     pub name: String,
     cells: HashMap<(u32, u32), CellContent>,
+    styles: HashMap<(u32, u32), CellStyle>,
 }
 
 impl Sheet {
@@ -63,6 +65,7 @@ impl Sheet {
         Sheet {
             name: name.into(),
             cells: HashMap::new(),
+            styles: HashMap::new(),
         }
     }
 
@@ -123,6 +126,36 @@ impl Sheet {
     /// Borrow the content stored at a coordinate, if any.
     pub fn content(&self, col: u32, row: u32) -> Option<&CellContent> {
         self.cells.get(&(col, row))
+    }
+
+    /// Set the visual style of a cell. Setting the default style clears it.
+    pub fn set_style(&mut self, r: CellRef, style: CellStyle) {
+        if style.is_default() {
+            self.styles.remove(&(r.col, r.row));
+        } else {
+            self.styles.insert((r.col, r.row), style);
+        }
+    }
+
+    /// The style of a cell, if one is set.
+    pub fn style(&self, r: CellRef) -> Option<&CellStyle> {
+        self.styles.get(&(r.col, r.row))
+    }
+
+    /// Mutably access a cell's style, inserting a default if absent. Useful for
+    /// tweaking one attribute.
+    pub fn style_mut(&mut self, r: CellRef) -> &mut CellStyle {
+        self.styles.entry((r.col, r.row)).or_default()
+    }
+
+    /// The displayed text of a cell: its computed value rendered through the
+    /// cell's number format (or `General` if it has none).
+    pub fn display(&self, r: CellRef) -> String {
+        let value = self.get(r);
+        match self.style(r).and_then(|s| s.number_format.as_deref()) {
+            Some(code) => crate::format::format_value(&value, code),
+            None => value.as_text(),
+        }
     }
 
     /// The raw, editable text of a cell — what you'd type to recreate it.
@@ -207,6 +240,14 @@ impl Sheet {
                 literal => literal,
             };
             self.cells.insert(new_key, new_content);
+        }
+
+        // Styles move with their cells (dropped if their cell was deleted).
+        let old_styles = std::mem::take(&mut self.styles);
+        for (key, style) in old_styles {
+            if let Some(new_key) = reposition(key, axis, &edit) {
+                self.styles.insert(new_key, style);
+            }
         }
     }
 
@@ -529,6 +570,31 @@ mod tests {
         s.delete_cols(0, 1);
         assert_eq!(s.raw_text(cell("B1")), "=#REF!+1");
         assert_eq!(s.get(cell("B1")), Value::Error(CellError::Ref));
+    }
+
+    #[test]
+    fn style_set_get_and_display() {
+        let mut s = Sheet::new("Sheet1");
+        s.set_input(cell("A1"), "1234.5").unwrap();
+        s.style_mut(cell("A1")).number_format = Some("#,##0.00".into());
+        s.style_mut(cell("A1")).font.bold = true;
+
+        assert_eq!(s.display(cell("A1")), "1,234.50");
+        assert!(s.style(cell("A1")).unwrap().font.bold);
+        // A cell without a number format displays its general value.
+        s.set_input(cell("A2"), "5").unwrap();
+        assert_eq!(s.display(cell("A2")), "5");
+    }
+
+    #[test]
+    fn styles_follow_cells_through_structural_edits() {
+        let mut s = Sheet::new("Sheet1");
+        s.set_input(cell("A2"), "x").unwrap();
+        s.style_mut(cell("A2")).font.italic = true;
+        // Insert a row at the top: A2 (and its style) move to A3.
+        s.insert_rows(0, 1);
+        assert!(s.style(cell("A3")).unwrap().font.italic);
+        assert!(s.style(cell("A2")).is_none());
     }
 
     #[test]

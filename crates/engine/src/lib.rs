@@ -25,6 +25,7 @@ pub mod format;
 pub mod formula;
 pub mod recalc;
 pub mod sheet;
+pub mod style;
 pub mod value;
 pub mod workbook;
 
@@ -36,5 +37,6 @@ pub use format::format_value;
 pub use formula::{BinOp, Expr};
 pub use recalc::RecalcEngine;
 pub use sheet::{CellContent, Sheet};
+pub use style::{Alignment, Border, BorderStyle, Borders, CellStyle, Color, Font, HAlign, VAlign};
 pub use value::{CellError, Value};
 pub use workbook::{DefinedName, Workbook};
