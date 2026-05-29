@@ -17,6 +17,10 @@ pub enum EngineError {
     /// A formula failed to tokenize or parse.
     #[error("syntax error in formula: {0}")]
     Syntax(String),
+
+    /// An edit was rejected because the cell is locked on a protected sheet.
+    #[error("cell {0} is locked on a protected sheet")]
+    Locked(String),
 }
 
 /// Convenience alias used throughout the crate.

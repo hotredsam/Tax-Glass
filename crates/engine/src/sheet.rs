@@ -10,7 +10,7 @@ use crate::style::CellStyle;
 use crate::validation::Validation;
 use crate::value::Value;
 use crate::view::ViewState;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Which axis a structural edit applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +89,10 @@ pub struct Sheet {
     validations: Vec<Validation>,
     comments: HashMap<(u32, u32), Comment>,
     view: ViewState,
+    protected: bool,
+    /// Cells explicitly unlocked. Cells are locked by default (Excel semantics),
+    /// but locking only takes effect while the sheet is protected.
+    unlocked: HashSet<(u32, u32)>,
 }
 
 impl Sheet {
@@ -102,6 +106,8 @@ impl Sheet {
             validations: Vec::new(),
             comments: HashMap::new(),
             view: ViewState::default(),
+            protected: false,
+            unlocked: HashSet::new(),
         }
     }
 
@@ -212,6 +218,52 @@ impl Sheet {
     pub fn conditional_styles(&self) -> HashMap<(u32, u32), CellStyle> {
         let computed = self.evaluate();
         crate::condformat::effective_styles(&self.cond_rules, &computed)
+    }
+
+    /// Enable sheet protection. While protected, locked cells reject guarded
+    /// edits.
+    pub fn protect(&mut self) {
+        self.protected = true;
+    }
+
+    /// Disable sheet protection.
+    pub fn unprotect(&mut self) {
+        self.protected = false;
+    }
+
+    /// Whether the sheet is protected.
+    pub fn is_protected(&self) -> bool {
+        self.protected
+    }
+
+    /// Lock or unlock a cell. Cells are locked by default; this records the
+    /// exceptions.
+    pub fn set_locked(&mut self, r: CellRef, locked: bool) {
+        if locked {
+            self.unlocked.remove(&(r.col, r.row));
+        } else {
+            self.unlocked.insert((r.col, r.row));
+        }
+    }
+
+    /// Whether a cell is locked (the default).
+    pub fn is_locked(&self, r: CellRef) -> bool {
+        !self.unlocked.contains(&(r.col, r.row))
+    }
+
+    /// Whether a cell may currently be edited: always when unprotected, else
+    /// only if the cell is unlocked.
+    pub fn is_editable(&self, r: CellRef) -> bool {
+        !self.protected || !self.is_locked(r)
+    }
+
+    /// Like [`Sheet::set_input`], but rejected with [`EngineError::Locked`] when
+    /// the cell is locked on a protected sheet.
+    pub fn try_set_input(&mut self, r: CellRef, raw: &str) -> Result<()> {
+        if !self.is_editable(r) {
+            return Err(crate::error::EngineError::Locked(r.to_a1()));
+        }
+        self.set_input(r, raw)
     }
 
     /// The sheet's view state (frozen panes, zoom, selection).
@@ -395,6 +447,14 @@ impl Sheet {
         for (key, comment) in old_comments {
             if let Some(new_key) = reposition(key, axis, &edit) {
                 self.comments.insert(new_key, comment);
+            }
+        }
+
+        // Per-cell lock exceptions follow their cells.
+        let old_unlocked = std::mem::take(&mut self.unlocked);
+        for key in old_unlocked {
+            if let Some(new_key) = reposition(key, axis, &edit) {
+                self.unlocked.insert(new_key);
             }
         }
     }
@@ -732,6 +792,27 @@ mod tests {
         // A cell without a number format displays its general value.
         s.set_input(cell("A2"), "5").unwrap();
         assert_eq!(s.display(cell("A2")), "5");
+    }
+
+    #[test]
+    fn protection_blocks_locked_cells_only() {
+        let mut s = Sheet::new("Sheet1");
+        // Unprotected: everything is editable.
+        assert!(s.is_editable(cell("A1")));
+        s.try_set_input(cell("A1"), "1").unwrap();
+
+        // Unlock B1, then protect: A1 is locked, B1 is not.
+        s.set_locked(cell("B1"), false);
+        s.protect();
+        assert!(!s.is_editable(cell("A1")));
+        assert!(s.is_editable(cell("B1")));
+
+        assert!(s.try_set_input(cell("A1"), "2").is_err());
+        s.try_set_input(cell("B1"), "9").unwrap();
+        assert_eq!(s.get(cell("B1")), Value::Number(9.0));
+
+        s.unprotect();
+        assert!(s.try_set_input(cell("A1"), "3").is_ok());
     }
 
     #[test]
