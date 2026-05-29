@@ -107,8 +107,7 @@ pub fn evaluate_sheet(sheet: &Sheet) -> HashMap<(u32, u32), Value> {
         if !is_array_top(ast) {
             continue;
         }
-        let ast = ast.clone();
-        let grid = ev.eval_array(&ast);
+        let grid = ev.eval_array(ast);
         let rows = grid.len() as u32;
         let cols = grid.first().map(|r| r.len()).unwrap_or(0) as u32;
 
@@ -234,9 +233,8 @@ pub fn evaluate_sheet_iterative(
         for &(col, row) in &formula_keys {
             let new_val = match sheet.content(col, row) {
                 Some(CellContent::Formula { ast, .. }) => {
-                    let ast = ast.clone();
                     let mut ev = Evaluator::with_snapshot(sheet, 0, &snapshot);
-                    ev.eval(&ast)
+                    ev.eval(ast)
                 }
                 _ => Value::Empty,
             };
@@ -349,15 +347,19 @@ impl<'a> Evaluator<'a> {
             return Value::Error(CellError::Circular);
         }
 
-        let value = match self.cells.content(sheet, col, row) {
+        // `cells` is a `Copy` shared reference, so the borrowed cell content
+        // lives as long as the workbook — independent of `&mut self`. That lets
+        // us evaluate a formula's AST *in place* without cloning it (the hot
+        // path for every formula).
+        let cells = self.cells;
+        let value = match cells.content(sheet, col, row) {
             None => Value::Empty,
             Some(CellContent::Literal(v)) => v.clone(),
             Some(CellContent::Formula { ast, .. }) => {
-                let ast = ast.clone();
                 let saved = self.current;
                 self.current = sheet;
                 self.in_progress.insert(key);
-                let v = self.eval(&ast);
+                let v = self.eval(ast);
                 self.in_progress.remove(&key);
                 self.current = saved;
                 v
