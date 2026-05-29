@@ -622,6 +622,39 @@ impl<'a> Evaluator<'a> {
                     Value::Number(a - b * (a / b).floor())
                 }
             }),
+            // --- trigonometry ---
+            "PI" => {
+                if args.is_empty() {
+                    Value::Number(std::f64::consts::PI)
+                } else {
+                    Value::Error(CellError::Value)
+                }
+            }
+            "SIN" => self.scalar1(args, |n| Value::Number(n.sin())),
+            "COS" => self.scalar1(args, |n| Value::Number(n.cos())),
+            "TAN" => self.scalar1(args, |n| Value::Number(n.tan())),
+            "ASIN" => self.scalar1(args, |n| domain_num(n.abs() <= 1.0, n.asin())),
+            "ACOS" => self.scalar1(args, |n| domain_num(n.abs() <= 1.0, n.acos())),
+            "ATAN" => self.scalar1(args, |n| Value::Number(n.atan())),
+            // Excel's ATAN2 takes (x, y) and returns atan(y/x).
+            "ATAN2" => self.scalar2(args, |x, y| Value::Number(y.atan2(x))),
+            "DEGREES" => self.scalar1(args, |n| Value::Number(n.to_degrees())),
+            "RADIANS" => self.scalar1(args, |n| Value::Number(n.to_radians())),
+            // --- hyperbolic ---
+            "SINH" => self.scalar1(args, |n| Value::Number(n.sinh())),
+            "COSH" => self.scalar1(args, |n| Value::Number(n.cosh())),
+            "TANH" => self.scalar1(args, |n| Value::Number(n.tanh())),
+            "ASINH" => self.scalar1(args, |n| Value::Number(n.asinh())),
+            "ACOSH" => self.scalar1(args, |n| domain_num(n >= 1.0, n.acosh())),
+            "ATANH" => self.scalar1(args, |n| domain_num(n.abs() < 1.0, n.atanh())),
+            // --- logarithms & exponentials ---
+            "LN" => self.scalar1(args, |n| domain_num(n > 0.0, n.ln())),
+            "LOG10" => self.scalar1(args, |n| domain_num(n > 0.0, n.log10())),
+            "EXP" => self.scalar1(args, |n| Value::Number(n.exp())),
+            "SQRTPI" => self.scalar1(args, |n| {
+                domain_num(n >= 0.0, (n * std::f64::consts::PI).sqrt())
+            }),
+            "LOG" => self.func_log(args),
             "ROUND" => self.round_family(args, RoundMode::Half),
             "ROUNDUP" => self.round_family(args, RoundMode::Up),
             "ROUNDDOWN" => self.round_family(args, RoundMode::Down),
@@ -807,6 +840,30 @@ impl<'a> Evaluator<'a> {
                     Value::Number(sum / count as f64)
                 }
             }
+        }
+    }
+
+    /// LOG(number, [base=10]).
+    fn func_log(&mut self, args: &[Expr]) -> Value {
+        if args.is_empty() || args.len() > 2 {
+            return Value::Error(CellError::Value);
+        }
+        let n = match self.eval(&args[0]).as_number() {
+            Ok(n) => n,
+            Err(e) => return Value::Error(e),
+        };
+        let base = if args.len() == 2 {
+            match self.eval(&args[1]).as_number() {
+                Ok(b) => b,
+                Err(e) => return Value::Error(e),
+            }
+        } else {
+            10.0
+        };
+        if n <= 0.0 || base <= 0.0 || base == 1.0 {
+            Value::Error(CellError::Num)
+        } else {
+            Value::Number(n.log(base))
         }
     }
 
@@ -1105,6 +1162,15 @@ enum IfsKind {
     Count,
 }
 
+/// Return `Number(value)` when `in_domain`, else a `#NUM!` error.
+fn domain_num(in_domain: bool, value: f64) -> Value {
+    if in_domain {
+        Value::Number(value)
+    } else {
+        Value::Error(CellError::Num)
+    }
+}
+
 /// Round away from zero to the next even (`even = true`) or odd integer.
 fn round_to_parity(n: f64, even: bool) -> f64 {
     if n == 0.0 {
@@ -1336,6 +1402,28 @@ mod tests {
             ("A4", "=A3^2"),
         ]);
         assert_eq!(val(&s, "A4"), Value::Number(64.0));
+    }
+
+    #[test]
+    fn trig_and_logs() {
+        let s = sheet_with(&[
+            ("A1", "=SIN(0)"),
+            ("A2", "=COS(0)"),
+            ("A3", "=DEGREES(PI())"),
+            ("A4", "=LN(EXP(1))"),
+            ("A5", "=LOG(1000)"),
+            ("A6", "=LOG(8,2)"),
+            ("A7", "=ASIN(2)"),
+            ("A8", "=ATAN2(1,1)"),
+        ]);
+        assert_eq!(val(&s, "A1"), Value::Number(0.0));
+        assert_eq!(val(&s, "A2"), Value::Number(1.0));
+        assert_eq!(val(&s, "A3"), Value::Number(180.0));
+        assert!((val(&s, "A4").as_number().unwrap() - 1.0).abs() < 1e-9);
+        assert!((val(&s, "A5").as_number().unwrap() - 3.0).abs() < 1e-9);
+        assert!((val(&s, "A6").as_number().unwrap() - 3.0).abs() < 1e-9);
+        assert_eq!(val(&s, "A7"), Value::Error(CellError::Num)); // asin domain
+        assert!((val(&s, "A8").as_number().unwrap() - std::f64::consts::FRAC_PI_4).abs() < 1e-9);
     }
 
     #[test]
