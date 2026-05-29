@@ -93,6 +93,8 @@ pub struct Sheet {
     /// Cells explicitly unlocked. Cells are locked by default (Excel semantics),
     /// but locking only takes effect while the sheet is protected.
     unlocked: HashSet<(u32, u32)>,
+    /// Merged regions; the top-left cell is the anchor and holds the value.
+    merges: Vec<CellRange>,
 }
 
 impl Sheet {
@@ -108,6 +110,7 @@ impl Sheet {
             view: ViewState::default(),
             protected: false,
             unlocked: HashSet::new(),
+            merges: Vec::new(),
         }
     }
 
@@ -218,6 +221,60 @@ impl Sheet {
     pub fn conditional_styles(&self) -> HashMap<(u32, u32), CellStyle> {
         let computed = self.evaluate();
         crate::condformat::effective_styles(&self.cond_rules, &computed)
+    }
+
+    /// Merge a range into one cell. The top-left cell is the anchor and keeps
+    /// its value; every other cell in the region is cleared. Errors if the
+    /// range overlaps an existing merge.
+    pub fn merge(&mut self, range: CellRange) -> Result<()> {
+        if self.merges.iter().any(|m| ranges_overlap(m, &range)) {
+            return Err(crate::error::EngineError::BadReference(format!(
+                "merge {range} overlaps an existing merge"
+            )));
+        }
+        let anchor = (range.start.col, range.start.row);
+        for c in range.cells() {
+            if (c.col, c.row) != anchor {
+                self.cells.remove(&(c.col, c.row));
+                self.styles.remove(&(c.col, c.row));
+            }
+        }
+        self.merges.push(range);
+        Ok(())
+    }
+
+    /// Remove the merge that covers a cell, if any. Returns whether one was
+    /// removed.
+    pub fn unmerge(&mut self, r: CellRef) -> bool {
+        if let Some(i) = self.merges.iter().position(|m| m.contains(r)) {
+            self.merges.remove(i);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// All merged regions.
+    pub fn merged_regions(&self) -> &[CellRange] {
+        &self.merges
+    }
+
+    /// The merged region containing a cell, if any.
+    pub fn merge_at(&self, r: CellRef) -> Option<CellRange> {
+        self.merges.iter().find(|m| m.contains(r)).copied()
+    }
+
+    /// Whether a cell is the anchor (top-left) of a merged region.
+    pub fn is_merge_anchor(&self, r: CellRef) -> bool {
+        self.merges
+            .iter()
+            .any(|m| m.start.col == r.col && m.start.row == r.row)
+    }
+
+    /// Whether a cell is covered by a merge but is not its anchor.
+    pub fn is_merge_covered(&self, r: CellRef) -> bool {
+        self.merge_at(r)
+            .is_some_and(|m| !(m.start.col == r.col && m.start.row == r.row))
     }
 
     /// Enable sheet protection. While protected, locked cells reject guarded
@@ -457,6 +514,15 @@ impl Sheet {
                 self.unlocked.insert(new_key);
             }
         }
+
+        // Merged regions shift/shrink on their edited axis; fully-deleted ones
+        // are dropped.
+        let old_merges = std::mem::take(&mut self.merges);
+        for region in old_merges {
+            if let Some(adjusted) = adjust_region(region, axis, &edit) {
+                self.merges.push(adjusted);
+            }
+        }
     }
 
     /// Copy a cell to another location, translating relative references like a
@@ -515,6 +581,34 @@ impl Sheet {
             .cloned()
             .unwrap_or(Value::Empty)
     }
+}
+
+/// Whether two ranges overlap on both axes.
+fn ranges_overlap(a: &CellRange, b: &CellRange) -> bool {
+    a.start.col <= b.end.col
+        && b.start.col <= a.end.col
+        && a.start.row <= b.end.row
+        && b.start.row <= a.end.row
+}
+
+/// Adjust a merged region for a structural edit on one axis, shifting/shrinking
+/// it and dropping it if fully deleted.
+fn adjust_region(region: CellRange, axis: Axis, edit: &Edit) -> Option<CellRange> {
+    let (start_idx, end_idx) = match axis {
+        Axis::Row => (region.start.row, region.end.row),
+        Axis::Col => (region.start.col, region.end.col),
+    };
+    let (s, e) = adjust_span(start_idx, end_idx, edit)?;
+    Some(match axis {
+        Axis::Row => CellRange {
+            start: with_axis_index(region.start, Axis::Row, s),
+            end: with_axis_index(region.end, Axis::Row, e),
+        },
+        Axis::Col => CellRange {
+            start: with_axis_index(region.start, Axis::Col, s),
+            end: with_axis_index(region.end, Axis::Col, e),
+        },
+    })
 }
 
 /// Map a stored cell's coordinate through a structural edit, or `None` if the
@@ -792,6 +886,38 @@ mod tests {
         // A cell without a number format displays its general value.
         s.set_input(cell("A2"), "5").unwrap();
         assert_eq!(s.display(cell("A2")), "5");
+    }
+
+    #[test]
+    fn merge_clears_covered_cells_and_tracks_region() {
+        let mut s = Sheet::new("Sheet1");
+        s.set_input(cell("A1"), "title").unwrap();
+        s.set_input(cell("B1"), "junk").unwrap();
+        s.set_input(cell("A2"), "more").unwrap();
+
+        s.merge(CellRange::parse("A1:B2").unwrap()).unwrap();
+        // Anchor keeps its value; covered cells are cleared.
+        assert_eq!(s.get(cell("A1")), Value::Text("title".into()));
+        assert_eq!(s.get(cell("B1")), Value::Empty);
+        assert!(s.is_merge_anchor(cell("A1")));
+        assert!(s.is_merge_covered(cell("B2")));
+        assert!(!s.is_merge_covered(cell("A1")));
+
+        // Overlapping merges are rejected.
+        assert!(s.merge(CellRange::parse("B2:C3").unwrap()).is_err());
+
+        // Unmerge by any covered cell.
+        assert!(s.unmerge(cell("B2")));
+        assert!(s.merge_at(cell("A1")).is_none());
+    }
+
+    #[test]
+    fn merge_region_shifts_on_row_insert() {
+        let mut s = Sheet::new("Sheet1");
+        s.merge(CellRange::parse("A2:B3").unwrap()).unwrap();
+        s.insert_rows(0, 1); // push everything down one
+        let region = s.merge_at(cell("A3")).unwrap();
+        assert_eq!(region.to_string(), "A3:B4");
     }
 
     #[test]
